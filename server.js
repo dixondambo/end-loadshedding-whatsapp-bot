@@ -7,10 +7,10 @@ const userSessions = new Map();
 
 // Configuration - Updated with your details
 const CONFIG = {
-    WHATSAPP_TOKEN: 'EAAQTTOVSzc4BPDtfZAqwlnylGUNdDYZA2p49DNMQf2bnvzbRuVLbsROGHaPyUiXegBAVZC78R1EdSDfxqKapMBNZCetaX8fc0dR2boK3BRGRBZAkhILUv7c9PS45lyMu64TMvUhfyZCKQ6lPdkvZBA3ARr8MtZBRkvrZAeZAFEfENJnyU9iZA1hyQhVt0t8w0fI6QZDZD',
-    WHATSAPP_PHONE_ID: '768489836345252',
-    WEBHOOK_VERIFY_TOKEN: 'EndLoadshedding2024',
-    SALES_EMAIL: 'sales@endloadshedding.com'
+  WHATSAPP_TOKEN: process.env.WHATSAPP_TOKEN,
+  WHATSAPP_PHONE_ID: '768489836345252',
+  WEBHOOK_VERIFY_TOKEN: 'EndLoadshedding2024',
+  SALES_EMAIL: 'sales@endloadshedding.com'
 };
 
 app.use(express.json());
