@@ -5,19 +5,20 @@ const app = express();
 // User sessions storage
 const userSessions = new Map();
 
-// Configuration - Updated with your details
+// Configuration - Updated with your details and ChatGPT fixes
 const CONFIG = {
     WHATSAPP_TOKEN: process.env.WHATSAPP_TOKEN,
     WHATSAPP_PHONE_ID: '768489836345252',
     WEBHOOK_VERIFY_TOKEN: 'EndLoadshedding2024',
     SALES_EMAIL: 'sales@endloadshedding.com',
     
-    // Zoho CRM Configuration
+    // Zoho CRM Configuration (with ChatGPT fixes)
     ZOHO_CLIENT_ID: process.env.ZOHO_CLIENT_ID,
     ZOHO_CLIENT_SECRET: process.env.ZOHO_CLIENT_SECRET,
     ZOHO_REFRESH_TOKEN: process.env.ZOHO_REFRESH_TOKEN,
-    ZOHO_ACCESS_TOKEN: '', // Will be refreshed automatically
-    ZOHO_API_DOMAIN: process.env.ZOHO_API_DOMAIN || 'https://www.zohoapis.com'
+    ZOHO_DC: process.env.ZOHO_DC || 'com',
+    ZOHO_ACCESS_TOKEN: '',
+    ZOHO_API_DOMAIN: `https://www.zohoapis.${process.env.ZOHO_DC || 'com'}`
 };
 
 app.use(express.json());
@@ -25,17 +26,26 @@ app.use(express.json());
 // Refresh Zoho token on startup
 refreshZohoToken();
 
-// Refresh Zoho Access Token
+// Normalize phone number function
+function normalizePhone(p) { 
+    return (p || '').startsWith('+') ? p : `+${p}`; 
+}
+
+// Refresh Zoho Access Token (ChatGPT fix)
 async function refreshZohoToken() {
     try {
-        const response = await axios.post('https://accounts.zoho.com/oauth/v2/token', null, {
-            params: {
-                refresh_token: CONFIG.ZOHO_REFRESH_TOKEN,
-                client_id: CONFIG.ZOHO_CLIENT_ID,
-                client_secret: CONFIG.ZOHO_CLIENT_SECRET,
-                grant_type: 'refresh_token'
+        const response = await axios.post(
+            `https://accounts.zoho.${CONFIG.ZOHO_DC}/oauth/v2/token`,
+            null,
+            { 
+                params: {
+                    refresh_token: CONFIG.ZOHO_REFRESH_TOKEN,
+                    client_id: CONFIG.ZOHO_CLIENT_ID,
+                    client_secret: CONFIG.ZOHO_CLIENT_SECRET,
+                    grant_type: 'refresh_token'
+                }
             }
-        });
+        );
         
         CONFIG.ZOHO_ACCESS_TOKEN = response.data.access_token;
         console.log('✅ Zoho token refreshed successfully');
@@ -44,54 +54,45 @@ async function refreshZohoToken() {
     }
 }
 
-// Create Lead in Zoho CRM
+// Create Lead in Zoho CRM (ChatGPT fix with upsert and Last_Name)
 async function createZohoLead(leadData) {
     try {
         const leadPayload = {
             data: [{
                 "First_Name": leadData.firstName,
+                "Last_Name": leadData.firstName || 'Prospect',   // Zoho requires Last_Name
                 "Email": leadData.email,
-                "Phone": leadData.phoneNumber,
+                "Phone": normalizePhone(leadData.phoneNumber),
                 "Street": leadData.address,
-                "Lead_Source": "WhatsApp Chatbot",
+                "Lead_Source": "WhatsApp Bot",
                 "Company": "End Loadshedding Pty",
                 "Description": `Monthly Electricity Bill: ${leadData.electricalBill}\nLead captured via WhatsApp Bot on ${new Date().toLocaleString()}`,
                 "Lead_Status": "New Lead"
             }]
         };
 
-        const response = await axios.post(
-            `${CONFIG.ZOHO_API_DOMAIN}/crm/v2/Leads`,
-            leadPayload,
-            {
-                headers: {
-                    'Authorization': `Zoho-oauthtoken ${CONFIG.ZOHO_ACCESS_TOKEN}`,
-                    'Content-Type': 'application/json'
-                }
+        const url = `${CONFIG.ZOHO_API_DOMAIN}/crm/v2/Leads/upsert?duplicate_check_fields=Email,Phone`;
+        const response = await axios.post(url, leadPayload, {
+            headers: { 
+                'Authorization': `Zoho-oauthtoken ${CONFIG.ZOHO_ACCESS_TOKEN}`, 
+                'Content-Type': 'application/json' 
             }
-        );
+        });
 
-        if (response.data.data && response.data.data[0].status === 'success') {
-            const leadId = response.data.data[0].details.id;
-            console.log(`✅ Lead created in Zoho CRM with ID: ${leadId}`);
-            
-            // Add a note about the monthly bill
+        const resItem = response.data?.data?.[0];
+        if (resItem?.status === 'success') {
+            const leadId = resItem.details.id;
+            console.log(`✅ Lead upserted in Zoho CRM with ID: ${leadId}`);
             await addNoteToZohoLead(leadId, `Customer's monthly electricity bill: ${leadData.electricalBill}\nInterested in solar installation at: ${leadData.address}`);
-            
             return leadId;
-        } else {
-            throw new Error('Failed to create lead');
         }
+        throw new Error(JSON.stringify(response.data));
     } catch (error) {
         console.error('❌ Error creating Zoho lead:', error.response?.data || error.message);
-        
-        // If token expired, try refreshing and retry once
-        if (error.response?.status === 401) {
-            console.log('🔄 Token expired, refreshing...');
+        if (error.response?.status === 401) { // token expired
             await refreshZohoToken();
-            return createZohoLead(leadData); // Retry once
+            return createZohoLead(leadData);
         }
-        
         throw error;
     }
 }
@@ -173,7 +174,7 @@ async function handleMessage(message) {
     const phoneNumber = message.from;
     const messageText = message.text?.body?.trim();
     
-    // Check if it's a button response
+    // Check if it's a button response (ChatGPT fix)
     const isButtonResponse = message.interactive?.button_reply?.id;
     
     let session = userSessions.get(phoneNumber) || {
@@ -183,9 +184,9 @@ async function handleMessage(message) {
 
     console.log(`📱 Message from ${phoneNumber}: ${messageText || 'Button clicked: ' + isButtonResponse}`);
 
-    // Handle button responses
-    if (isButtonResponse === 'call_main_number') {
-        await sendMessage(phoneNumber, `📞 *Ready to call for a quick quote?*\n\nDial: *+27 84 336 0063*\n\nOur team is standing by to help you with instant quotes and technical questions! 🌞⚡`);
+    // Handle button responses (ChatGPT fix)
+    if (isButtonResponse === 'whatsapp_sales_team') {
+        await sendSimpleWhatsAppMessage(phoneNumber, session.data?.firstName || '');
         return;
     }
 
@@ -278,13 +279,6 @@ async function handleMessage(message) {
         case 'completed':
             await sendMessage(phoneNumber, "Thank you! A sales specialist will contact you soon. 😊");
             break;
-            
-        case 'button_response':
-            // Handle button clicks
-            if (message.interactive?.button_reply?.id === 'call_main_number') {
-                await sendMessage(phoneNumber, `📞 *Ready to call?*\n\nDial: *+27 84 336 0063*\n\nOur team is standing by to help you! 🌞⚡`);
-            }
-            break;
 
         default:
             await sendWelcomeMessage(phoneNumber);
@@ -339,7 +333,7 @@ Thank you for choosing End Loadshedding Pty! 🌞⚡`;
         // Lead is still captured locally, but failed to sync to CRM
     }
     
-    // Schedule follow-up message with call button (1 minute delay)
+    // Schedule follow-up message with WhatsApp button (1 minute delay)
     setTimeout(async () => {
         await sendQuickQuoteMessage(phoneNumber, leadData.firstName);
     }, 60000); // 60 seconds delay
@@ -384,7 +378,7 @@ async function sendQuickQuoteMessage(phoneNumber, firstName) {
         };
 
         await axios.post(
-            `https://graph.facebook.com/v18.0/${CONFIG.WHATSAPP_PHONE_ID}/messages`,
+            `https://graph.facebook.com/v20.0/${CONFIG.WHATSAPP_PHONE_ID}/messages`,
             quickQuoteMessage,
             {
                 headers: {
@@ -451,31 +445,9 @@ https://wa.me/27843360063?text=Hi%2C%20I%27m%20${encodeURIComponent(firstName)}%
     }
 }
 
-// Send Typing Indicator
-async function sendTypingIndicator(phoneNumber) {
-    try {
-        await axios.post(
-            `https://graph.facebook.com/v18.0/${CONFIG.WHATSAPP_PHONE_ID}/messages`,
-            {
-                messaging_product: 'whatsapp',
-                recipient_type: 'individual',
-                to: phoneNumber,
-                type: 'reaction',
-                reaction: {
-                    message_id: '', // Empty for typing indicator
-                    emoji: '⌨️'
-                }
-            },
-            {
-                headers: {
-                    'Authorization': `Bearer ${CONFIG.WHATSAPP_TOKEN}`,
-                    'Content-Type': 'application/json'
-                }
-            }
-        );
-    } catch (error) {
-        // Typing indicator is optional, don't log errors
-    }
+// Send Typing Indicator (ChatGPT fix - no-op to avoid errors)
+async function sendTypingIndicator() { 
+    /* no-op to avoid WhatsApp errors */ 
 }
 
 // Sleep function for delays
@@ -494,7 +466,7 @@ async function sendMessage(phoneNumber, message) {
         await sleep(typingDelay);
         
         await axios.post(
-            `https://graph.facebook.com/v18.0/${CONFIG.WHATSAPP_PHONE_ID}/messages`,
+            `https://graph.facebook.com/v20.0/${CONFIG.WHATSAPP_PHONE_ID}/messages`,
             {
                 messaging_product: 'whatsapp',
                 to: phoneNumber,
