@@ -1,18 +1,35 @@
 const express = require('express');
 const axios = require('axios');
-const nodemailer = require('nodemailer');
-const rateLimit = require('express-rate-limit');
-const helmet = require('helmet');
 const app = express();
 
-// Rate limiting
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100 // limit each IP to 100 requests per windowMs
-});
+// Only load optional dependencies if available
+let nodemailer, rateLimit, helmet;
+let emailEnabled = false;
 
-app.use(limiter);
-app.use(helmet());
+try {
+    nodemailer = require('nodemailer');
+    emailEnabled = true;
+    console.log('✅ Nodemailer loaded successfully');
+} catch (error) {
+    console.log('⚠️ Nodemailer not available, email features disabled');
+}
+
+try {
+    rateLimit = require('express-rate-limit');
+    helmet = require('helmet');
+    
+    // Apply security middleware only if available
+    const limiter = rateLimit({
+        windowMs: 15 * 60 * 1000, // 15 minutes
+        max: 100 // limit each IP to 100 requests per windowMs
+    });
+    app.use(limiter);
+    app.use(helmet());
+    console.log('✅ Security middleware loaded');
+} catch (error) {
+    console.log('⚠️ Security middleware not available, using basic setup');
+}
+
 app.use(express.json({ limit: '10mb' }));
 
 // User sessions storage with cleanup
@@ -56,32 +73,43 @@ for (const envVar of requiredEnvVars) {
     }
 }
 
-// Enhanced email transporter with better error handling
-const transporter = nodemailer.createTransporter({
-    service: 'gmail',
-    auth: {
-        user: CONFIG.EMAIL_USER,
-        pass: CONFIG.EMAIL_PASS
-    },
-    pool: true,
-    maxConnections: 5,
-    maxMessages: 100
-});
+// Email transporter setup (only if nodemailer is available)
+let transporter;
+if (emailEnabled && nodemailer) {
+    try {
+        transporter = nodemailer.createTransporter({
+            service: 'gmail',
+            auth: {
+                user: CONFIG.EMAIL_USER,
+                pass: CONFIG.EMAIL_PASS
+            },
+            pool: true,
+            maxConnections: 5,
+            maxMessages: 100
+        });
 
-// Verify email configuration on startup
-transporter.verify((error, success) => {
-    if (error) {
-        console.error('❌ Email configuration error:', error.message);
-    } else {
-        console.log('✅ Email server is ready');
+        // Verify email configuration on startup
+        transporter.verify((error, success) => {
+            if (error) {
+                console.error('❌ Email configuration error:', error.message);
+                emailEnabled = false;
+            } else {
+                console.log('✅ Email server is ready');
+            }
+        });
+    } catch (error) {
+        console.error('❌ Failed to create email transporter:', error.message);
+        emailEnabled = false;
     }
-});
+}
 
 // Webhook verification
 app.get('/webhook', (req, res) => {
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
+
+    console.log('🔍 Webhook verification attempt:', { mode, token: token ? 'provided' : 'missing' });
 
     if (mode === 'subscribe' && token === CONFIG.WEBHOOK_VERIFY_TOKEN) {
         console.log('✅ Webhook verified successfully!');
@@ -95,6 +123,7 @@ app.get('/webhook', (req, res) => {
 // Enhanced message receiver with better error handling
 app.post('/webhook', async (req, res) => {
     try {
+        console.log('📨 Webhook received:', JSON.stringify(req.body, null, 2));
         const body = req.body;
 
         if (body.object === 'whatsapp_business_account') {
@@ -127,8 +156,11 @@ async function handleMessage(message) {
         const phoneNumber = message.from;
         const messageText = message.text?.body?.trim() || '';
         
+        console.log(`📱 Processing message from ${phoneNumber}: "${messageText}"`);
+        
         // Skip empty messages or system messages
         if (!messageText || message.type !== 'text') {
+            console.log('⏭️ Skipping non-text or empty message');
             return;
         }
 
@@ -142,7 +174,7 @@ async function handleMessage(message) {
         // Update last activity
         session.lastActivity = Date.now();
 
-        console.log(`📱 Message from ${phoneNumber}: ${messageText}`);
+        console.log(`👤 Current session step: ${session.step}`);
 
         // Handle commands at any time
         const lowerText = messageText.toLowerCase();
@@ -150,6 +182,7 @@ async function handleMessage(message) {
             session.step = 'welcome';
             session.data = {};
             session.attempts = {};
+            console.log('🔄 Session restarted');
         } else if (lowerText.includes('help')) {
             await sendHelpMessage(phoneNumber);
             userSessions.set(phoneNumber, session);
@@ -170,6 +203,8 @@ async function handleMessage(message) {
 
 // Process conversation steps
 async function processStep(phoneNumber, messageText, session) {
+    console.log(`🔄 Processing step: ${session.step}`);
+    
     switch (session.step) {
         case 'welcome':
             await sendWelcomeMessage(phoneNumber);
@@ -197,6 +232,7 @@ async function processStep(phoneNumber, messageText, session) {
             break;
 
         default:
+            console.log(`⚠️ Unknown step: ${session.step}, resetting to welcome`);
             await sendWelcomeMessage(phoneNumber);
             session.step = 'email';
     }
@@ -329,8 +365,14 @@ async function completeLeadCapture(phoneNumber, leadData) {
 
     await sendMessage(phoneNumber, summaryMessage);
     
-    // Save lead (with retry logic)
-    await saveLeadWithRetry(leadData);
+    // Save lead (with retry logic) - only if email is enabled
+    if (emailEnabled) {
+        await saveLeadWithRetry(leadData);
+    } else {
+        // Log to console as fallback
+        console.log('📧 Email not available, logging lead data:');
+        console.log(JSON.stringify(leadData, null, 2));
+    }
     
     // Send follow-up after 2 minutes
     setTimeout(async () => {
@@ -352,6 +394,11 @@ async function completeLeadCapture(phoneNumber, leadData) {
 
 // Enhanced email saving with retry logic
 async function saveLeadWithRetry(leadData, retries = 3) {
+    if (!emailEnabled || !transporter) {
+        console.log('📧 Email not enabled, skipping email save');
+        return;
+    }
+
     for (let i = 0; i < retries; i++) {
         try {
             await saveLeadToEmail(leadData);
@@ -372,6 +419,10 @@ async function saveLeadWithRetry(leadData, retries = 3) {
 
 // Enhanced email content
 async function saveLeadToEmail(leadData) {
+    if (!transporter) {
+        throw new Error('Email transporter not available');
+    }
+
     const emailContent = `
 🎉 NEW SOLAR LEAD CAPTURED!
 
@@ -391,42 +442,11 @@ ${CONFIG.COMPANY_NAME} WhatsApp Bot
 Generated: ${new Date().toLocaleString('en-ZA')}
     `;
 
-    const htmlContent = `
-<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-    <h2 style="color: #2E8B57;">🎉 NEW SOLAR LEAD CAPTURED!</h2>
-    
-    <div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
-        <h3 style="color: #333;">👤 Customer Details:</h3>
-        <ul style="list-style: none; padding: 0;">
-            <li style="margin: 8px 0;"><strong>Name:</strong> ${leadData.firstName}</li>
-            <li style="margin: 8px 0;"><strong>Phone:</strong> <a href="tel:${leadData.phoneNumber}" style="color: #2E8B57;">${leadData.phoneNumber}</a></li>
-            <li style="margin: 8px 0;"><strong>Email:</strong> <a href="mailto:${leadData.email}" style="color: #2E8B57;">${leadData.email}</a></li>
-            <li style="margin: 8px 0;"><strong>Address:</strong> ${leadData.address}</li>
-            <li style="margin: 8px 0;"><strong>Monthly Bill:</strong> <span style="color: #d9534f; font-weight: bold;">${leadData.electricalBill}</span></li>
-            <li style="margin: 8px 0;"><strong>Date:</strong> ${new Date(leadData.timestamp).toLocaleString('en-ZA')}</li>
-        </ul>
-    </div>
-    
-    <div style="background: #d4edda; padding: 15px; border-radius: 8px; border-left: 4px solid #28a745;">
-        <p style="margin: 0; font-weight: bold; color: #155724;">💡 Priority: Follow up within 24 hours for best conversion!</p>
-        <p style="margin: 5px 0 0 0; color: #155724;">📞 Customer expects contact soon.</p>
-    </div>
-    
-    <hr style="margin: 20px 0;">
-    <p style="color: #666; font-size: 12px;">
-        <em>${CONFIG.COMPANY_NAME} WhatsApp Bot<br>
-        Generated: ${new Date().toLocaleString('en-ZA')}</em>
-    </p>
-</div>
-    `;
-
     await transporter.sendMail({
         from: `"${CONFIG.COMPANY_NAME} Bot" <${CONFIG.EMAIL_USER}>`,
         to: CONFIG.SALES_EMAIL,
-        cc: CONFIG.EMAIL_USER, // CC to the bot email for records
         subject: `🚨 NEW SOLAR LEAD: ${leadData.firstName} - ${leadData.electricalBill} monthly bill`,
-        text: emailContent,
-        html: htmlContent
+        text: emailContent
     });
 }
 
@@ -481,9 +501,11 @@ Contact us directly: ${CONFIG.SALES_PHONE}
 
 // Enhanced message sender with retry logic
 async function sendMessage(phoneNumber, message, retries = 3) {
+    console.log(`📤 Attempting to send message to ${phoneNumber}`);
+    
     for (let i = 0; i < retries; i++) {
         try {
-            await axios.post(
+            const response = await axios.post(
                 `https://graph.facebook.com/v20.0/${CONFIG.WHATSAPP_PHONE_ID}/messages`,
                 {
                     messaging_product: 'whatsapp',
@@ -508,6 +530,7 @@ async function sendMessage(phoneNumber, message, retries = 3) {
             }
         }
     }
+    console.error(`🚨 Failed to send message to ${phoneNumber} after ${retries} attempts`);
 }
 
 // Enhanced email validation
@@ -529,7 +552,11 @@ app.get('/health', (req, res) => {
         uptime: process.uptime(),
         activeSessions: userSessions.size,
         environment: process.env.NODE_ENV || 'development',
-        version: '2.0.0'
+        version: '2.1.0',
+        features: {
+            email: emailEnabled,
+            whatsapp: !!CONFIG.WHATSAPP_TOKEN
+        }
     };
     
     res.json(stats);
@@ -540,7 +567,22 @@ app.get('/stats', (req, res) => {
     res.json({
         activeSessions: userSessions.size,
         totalMemoryUsage: process.memoryUsage(),
-        uptime: process.uptime()
+        uptime: process.uptime(),
+        emailEnabled
+    });
+});
+
+// Test endpoint for debugging
+app.get('/test', (req, res) => {
+    res.json({
+        message: 'Bot is running!',
+        config: {
+            hasWhatsAppToken: !!CONFIG.WHATSAPP_TOKEN,
+            whatsappPhoneId: CONFIG.WHATSAPP_PHONE_ID,
+            webhookToken: !!CONFIG.WEBHOOK_VERIFY_TOKEN,
+            emailEnabled,
+            environment: process.env.NODE_ENV
+        }
     });
 });
 
@@ -553,10 +595,17 @@ process.on('SIGTERM', () => {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`🤖 ${CONFIG.COMPANY_NAME} Chatbot v2.0 is running!`);
+    console.log(`🤖 ${CONFIG.COMPANY_NAME} Chatbot v2.1 is running!`);
     console.log(`📡 Server: http://localhost:${PORT}`);
     console.log(`🔗 Webhook: https://your-app-url.com/webhook`);
-    console.log(`📧 Leads sent to: ${CONFIG.SALES_EMAIL}`);
+    console.log(`📧 Email enabled: ${emailEnabled}`);
     console.log(`📞 Sales WhatsApp: ${CONFIG.SALES_PHONE}`);
     console.log('💡 Ready to capture solar leads!');
+    
+    // Test basic functionality
+    console.log('\n🧪 Running startup tests...');
+    console.log(`✅ WhatsApp Token: ${CONFIG.WHATSAPP_TOKEN ? 'Set' : 'Missing'}`);
+    console.log(`✅ Phone ID: ${CONFIG.WHATSAPP_PHONE_ID}`);
+    console.log(`✅ Webhook Token: ${CONFIG.WEBHOOK_VERIFY_TOKEN ? 'Set' : 'Missing'}`);
+    console.log(`✅ Email: ${emailEnabled ? 'Configured' : 'Disabled'}`);
 });
