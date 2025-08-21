@@ -1,31 +1,79 @@
 const express = require('express');
 const axios = require('axios');
 const nodemailer = require('nodemailer');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
 const app = express();
 
-// User sessions storage
-const userSessions = new Map();
+// Rate limiting
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100 // limit each IP to 100 requests per windowMs
+});
 
-// Configuration
+app.use(limiter);
+app.use(helmet());
+app.use(express.json({ limit: '10mb' }));
+
+// User sessions storage with cleanup
+const userSessions = new Map();
+const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+
+// Clean up old sessions every hour
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, session] of userSessions.entries()) {
+        if (now - session.lastActivity > SESSION_TIMEOUT) {
+            userSessions.delete(key);
+        }
+    }
+}, 60 * 60 * 1000);
+
+// Configuration with better environment handling
 const CONFIG = {
-    WHATSAPP_TOKEN: process.env.WHATSAPP_TOKEN,
-    WHATSAPP_PHONE_ID: '768489836345252',
-    WEBHOOK_VERIFY_TOKEN: 'EndLoadshedding2024',
-    SALES_EMAIL: 'sales@endloadshedding.com',
+    WHATSAPP_TOKEN: process.env.WHATSAPP_TOKEN || '',
+    WHATSAPP_PHONE_ID: process.env.WHATSAPP_PHONE_ID || '768489836345252',
+    WEBHOOK_VERIFY_TOKEN: process.env.WEBHOOK_VERIFY_TOKEN || 'EndLoadshedding2024',
+    SALES_EMAIL: process.env.SALES_EMAIL || 'endloadshedding@gmail.com',
     
-    // Email configuration for lead capture
-    EMAIL_USER: process.env.EMAIL_USER || 'your-gmail@gmail.com',
-    EMAIL_PASS: process.env.EMAIL_PASS || 'your-app-password'
+    // Updated email configuration
+    EMAIL_USER: process.env.EMAIL_USER || 'endloadshedding@gmail.com',
+    EMAIL_PASS: process.env.EMAIL_PASS || 'Solar@2025',
+    
+    // Business settings
+    SALES_PHONE: '+27843360063',
+    COMPANY_NAME: 'End Loadshedding Pty Ltd',
+    RESPONSE_DELAY: 2000,
+    MIN_BILL_AMOUNT: 200,
+    MAX_BILL_AMOUNT: 50000
 };
 
-app.use(express.json());
+// Validate required environment variables
+const requiredEnvVars = ['WHATSAPP_TOKEN'];
+for (const envVar of requiredEnvVars) {
+    if (!process.env[envVar]) {
+        console.warn(`⚠️  Warning: ${envVar} not set in environment variables`);
+    }
+}
 
-// Email transporter setup
+// Enhanced email transporter with better error handling
 const transporter = nodemailer.createTransporter({
     service: 'gmail',
     auth: {
         user: CONFIG.EMAIL_USER,
         pass: CONFIG.EMAIL_PASS
+    },
+    pool: true,
+    maxConnections: 5,
+    maxMessages: 100
+});
+
+// Verify email configuration on startup
+transporter.verify((error, success) => {
+    if (error) {
+        console.error('❌ Email configuration error:', error.message);
+    } else {
+        console.log('✅ Email server is ready');
     }
 });
 
@@ -44,131 +92,229 @@ app.get('/webhook', (req, res) => {
     }
 });
 
-// Receive messages
+// Enhanced message receiver with better error handling
 app.post('/webhook', async (req, res) => {
     try {
         const body = req.body;
 
         if (body.object === 'whatsapp_business_account') {
-            body.entry.forEach(async (entry) => {
-                const changes = entry.changes;
-                changes.forEach(async (change) => {
-                    if (change.field === 'messages') {
-                        const messages = change.value.messages;
-                        if (messages) {
-                            for (const message of messages) {
-                                await handleMessage(message);
-                            }
-                        }
+            const promises = [];
+            
+            body.entry.forEach((entry) => {
+                entry.changes.forEach((change) => {
+                    if (change.field === 'messages' && change.value.messages) {
+                        change.value.messages.forEach((message) => {
+                            promises.push(handleMessage(message));
+                        });
                     }
                 });
             });
+
+            // Handle all messages concurrently
+            await Promise.allSettled(promises);
         }
 
         res.status(200).send('OK');
     } catch (error) {
-        console.error('❌ Error:', error);
+        console.error('❌ Webhook error:', error);
         res.status(500).send('Error');
     }
 });
 
-// Handle incoming messages
+// Enhanced message handler with better flow control
 async function handleMessage(message) {
-    const phoneNumber = message.from;
-    const messageText = message.text?.body?.trim();
-    
-    let session = userSessions.get(phoneNumber) || {
-        step: 'welcome',
-        data: {}
-    };
+    try {
+        const phoneNumber = message.from;
+        const messageText = message.text?.body?.trim() || '';
+        
+        // Skip empty messages or system messages
+        if (!messageText || message.type !== 'text') {
+            return;
+        }
 
-    console.log(`📱 Message from ${phoneNumber}: ${messageText}`);
+        let session = userSessions.get(phoneNumber) || {
+            step: 'welcome',
+            data: {},
+            lastActivity: Date.now(),
+            attempts: {}
+        };
 
-    // Add realistic delay
-    await sleep(2000);
+        // Update last activity
+        session.lastActivity = Date.now();
 
+        console.log(`📱 Message from ${phoneNumber}: ${messageText}`);
+
+        // Handle commands at any time
+        const lowerText = messageText.toLowerCase();
+        if (lowerText.includes('restart') || lowerText.includes('start over')) {
+            session.step = 'welcome';
+            session.data = {};
+            session.attempts = {};
+        } else if (lowerText.includes('help')) {
+            await sendHelpMessage(phoneNumber);
+            userSessions.set(phoneNumber, session);
+            return;
+        }
+
+        // Add realistic delay
+        await sleep(CONFIG.RESPONSE_DELAY);
+
+        await processStep(phoneNumber, messageText, session);
+        userSessions.set(phoneNumber, session);
+
+    } catch (error) {
+        console.error('❌ Message handling error:', error);
+        await sendMessage(phoneNumber, "Sorry, something went wrong. Please type 'restart' to begin again.");
+    }
+}
+
+// Process conversation steps
+async function processStep(phoneNumber, messageText, session) {
     switch (session.step) {
         case 'welcome':
-            await sendMessage(phoneNumber, `🔋 *Hey there! Welcome to End Loadshedding Pty Chatbot!*
-
-Before I connect you to a Customer Support Specialist, I need some quick info.
-
-Could you please share your best email address? 📧`);
+            await sendWelcomeMessage(phoneNumber);
             session.step = 'email';
             break;
 
         case 'email':
-            if (isValidEmail(messageText)) {
-                session.data.email = messageText;
-                await sendMessage(phoneNumber, "Perfect! ✅\n\nWhat's your first name?");
-                session.step = 'firstName';
-            } else {
-                await sendMessage(phoneNumber, "Please provide a valid email address (example: john@gmail.com):");
-            }
+            await handleEmailStep(phoneNumber, messageText, session);
             break;
 
         case 'firstName':
-            session.data.firstName = messageText;
-            await sendMessage(phoneNumber, `Nice to meet you, ${messageText}! 👋\n\nWhat's the physical address where the solar system will be installed?`);
-            session.step = 'address';
+            await handleFirstNameStep(phoneNumber, messageText, session);
             break;
 
         case 'address':
-            if (messageText.length < 10) {
-                await sendMessage(phoneNumber, "Please provide a complete physical address including street name, suburb, and city:");
-                break;
-            }
-            
-            session.data.address = messageText;
-            await sendMessage(phoneNumber, "Great! 📍\n\nWhat's your average monthly electricity bill amount in Rands? (example: R2500, R1800, R3200)");
-            session.step = 'electricalBill';
+            await handleAddressStep(phoneNumber, messageText, session);
             break;
 
         case 'electricalBill':
-            const cleanBill = messageText.replace(/\s+/g, '').toLowerCase();
-            const invalidResponses = ['idonotknow', 'idontknow', 'dontknow', 'unknown', 'unsure'];
-            const isInvalidResponse = invalidResponses.some(invalid => cleanBill.includes(invalid));
-            
-            if (isInvalidResponse) {
-                await sendMessage(phoneNumber, "Please check your latest electricity bill and provide the actual amount (example: R2500, R1800, R3200):");
-                break;
-            }
-            
-            const numberMatch = messageText.match(/\d+/);
-            if (!numberMatch) {
-                await sendMessage(phoneNumber, "Please provide the amount as a number (example: R2500, R1800, R3200):");
-                break;
-            }
-            
-            const billAmount = parseInt(numberMatch[0]);
-            if (billAmount < 200 || billAmount > 50000) {
-                await sendMessage(phoneNumber, "Please double-check and provide your monthly electricity bill amount (example: R2500, R1800, R3200):");
-                break;
-            }
-            
-            session.data.electricalBill = `R${billAmount}`;
-            session.data.phoneNumber = phoneNumber;
-            await completeLeadCapture(phoneNumber, session.data);
-            session.step = 'completed';
+            await handleElectricalBillStep(phoneNumber, messageText, session);
             break;
 
         case 'completed':
-            await sendMessage(phoneNumber, "Thank you! A sales specialist will contact you soon. 😊");
+            await sendMessage(phoneNumber, `Hi ${session.data.firstName}! A sales specialist will contact you soon. 😊\n\nFor urgent quotes, WhatsApp us: ${CONFIG.SALES_PHONE}`);
             break;
 
         default:
-            await sendMessage(phoneNumber, `🔋 *Hey there! Welcome to End Loadshedding Pty Chatbot!*
-
-Before I connect you to a Customer Support Specialist, I need some quick info.
-
-Could you please share your best email address? 📧`);
+            await sendWelcomeMessage(phoneNumber);
             session.step = 'email';
     }
-
-    userSessions.set(phoneNumber, session);
 }
 
-// Complete lead capture
+// Welcome message
+async function sendWelcomeMessage(phoneNumber) {
+    const welcomeMsg = `🔋 *Welcome to ${CONFIG.COMPANY_NAME} Chatbot!*
+
+Transform your home with solar power and say goodbye to loadshedding! 🌞
+
+Before connecting you to our specialists, I need some quick info.
+
+Please share your best email address: 📧
+
+_Type 'help' for assistance or 'restart' to start over_`;
+    
+    await sendMessage(phoneNumber, welcomeMsg);
+}
+
+// Handle email step with validation
+async function handleEmailStep(phoneNumber, messageText, session) {
+    if (isValidEmail(messageText)) {
+        session.data.email = messageText.toLowerCase();
+        await sendMessage(phoneNumber, "Perfect! ✅\n\nWhat's your first name?");
+        session.step = 'firstName';
+        session.attempts.email = 0;
+    } else {
+        session.attempts.email = (session.attempts.email || 0) + 1;
+        
+        if (session.attempts.email >= 3) {
+            await sendMessage(phoneNumber, "Having trouble with your email? Type 'help' for assistance or contact us directly at " + CONFIG.SALES_PHONE);
+            return;
+        }
+        
+        await sendMessage(phoneNumber, "Please provide a valid email address:\n\n📧 Example: john@gmail.com\n\n_Make sure it includes @ and a domain like .com_");
+    }
+}
+
+// Handle first name step
+async function handleFirstNameStep(phoneNumber, messageText, session) {
+    if (messageText.length < 2 || messageText.length > 50) {
+        await sendMessage(phoneNumber, "Please provide your first name (2-50 characters):");
+        return;
+    }
+    
+    // Clean the name
+    const firstName = messageText.replace(/[^a-zA-Z\s]/g, '').trim();
+    if (firstName.length < 2) {
+        await sendMessage(phoneNumber, "Please provide a valid first name using letters only:");
+        return;
+    }
+    
+    session.data.firstName = firstName;
+    await sendMessage(phoneNumber, `Nice to meet you, ${firstName}! 👋\n\nWhat's the physical address where you'd like to install solar?\n\n📍 Please include street, suburb, and city`);
+    session.step = 'address';
+}
+
+// Handle address step
+async function handleAddressStep(phoneNumber, messageText, session) {
+    if (messageText.length < 15) {
+        session.attempts.address = (session.attempts.address || 0) + 1;
+        
+        if (session.attempts.address >= 3) {
+            await sendMessage(phoneNumber, "Need help with your address? Contact us directly at " + CONFIG.SALES_PHONE);
+            return;
+        }
+        
+        await sendMessage(phoneNumber, "Please provide a complete address:\n\n📍 Example: 123 Main Street, Sandton, Johannesburg\n\n_Include street name, suburb, and city_");
+        return;
+    }
+    
+    session.data.address = messageText.trim();
+    await sendMessage(phoneNumber, `Great! 📍\n\nWhat's your average monthly electricity bill?\n\n💡 Example: R2500, R1800, R3200\n\n_This helps us size your system correctly_`);
+    session.step = 'electricalBill';
+}
+
+// Handle electrical bill step with enhanced validation
+async function handleElectricalBillStep(phoneNumber, messageText, session) {
+    const cleanBill = messageText.replace(/\s+/g, '').toLowerCase();
+    const invalidResponses = ['idonotknow', 'idontknow', 'dontknow', 'unknown', 'unsure', 'donno', 'dk'];
+    const isInvalidResponse = invalidResponses.some(invalid => cleanBill.includes(invalid));
+    
+    if (isInvalidResponse) {
+        await sendMessage(phoneNumber, "No worries! Please check your latest Eskom/City Power bill and share the total amount:\n\n💡 Example: R2500, R1800, R3200");
+        return;
+    }
+    
+    // Enhanced number extraction
+    const numberMatch = messageText.match(/(?:r\s*)?(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2})?)/i);
+    if (!numberMatch) {
+        session.attempts.bill = (session.attempts.bill || 0) + 1;
+        
+        if (session.attempts.bill >= 3) {
+            await sendMessage(phoneNumber, "Having trouble? Contact us directly for assistance: " + CONFIG.SALES_PHONE);
+            return;
+        }
+        
+        await sendMessage(phoneNumber, "Please provide your bill amount as a number:\n\n💡 Example: 2500, R1800, or 3200\n\n_Just the rand amount from your electricity bill_");
+        return;
+    }
+    
+    const billAmount = parseInt(numberMatch[1].replace(/[,\s]/g, ''));
+    
+    if (billAmount < CONFIG.MIN_BILL_AMOUNT || billAmount > CONFIG.MAX_BILL_AMOUNT) {
+        await sendMessage(phoneNumber, `Please double-check your monthly bill amount:\n\n• Should be between R${CONFIG.MIN_BILL_AMOUNT} - R${CONFIG.MAX_BILL_AMOUNT}\n• Check your latest bill for the exact amount`);
+        return;
+    }
+    
+    session.data.electricalBill = `R${billAmount.toLocaleString()}`;
+    session.data.phoneNumber = phoneNumber;
+    session.data.timestamp = new Date().toISOString();
+    
+    await completeLeadCapture(phoneNumber, session.data);
+    session.step = 'completed';
+}
+
+// Enhanced lead completion
 async function completeLeadCapture(phoneNumber, leadData) {
     const summaryMessage = `✅ *Perfect! Thank you ${leadData.firstName}!*
 
@@ -177,35 +323,57 @@ async function completeLeadCapture(phoneNumber, leadData) {
 📍 Address: ${leadData.address}
 💡 Monthly Bill: ${leadData.electricalBill}
 
-🎯 *Our sales specialist will contact you within 24 hours!*
+🎯 *Our specialist will contact you within 24 hours!*
 
-Thank you for choosing End Loadshedding Pty! 🌞⚡`;
+🌞 Get ready to save money and beat loadshedding!`;
 
     await sendMessage(phoneNumber, summaryMessage);
     
-    // Save lead to email (guaranteed to work)
-    await saveLeadToEmail(leadData);
+    // Save lead (with retry logic)
+    await saveLeadWithRetry(leadData);
     
-    // Send follow-up after 1 minute
+    // Send follow-up after 2 minutes
     setTimeout(async () => {
         await sendFollowUpMessage(phoneNumber, leadData.firstName);
-    }, 60000);
+    }, 120000);
     
+    // Enhanced logging
     console.log('🎉 NEW LEAD CAPTURED:');
-    console.log('Name:', leadData.firstName);
-    console.log('Phone:', phoneNumber);
-    console.log('Email:', leadData.email);
-    console.log('Address:', leadData.address);
-    console.log('Monthly Bill:', leadData.electricalBill);
-    console.log('Time:', new Date().toLocaleString());
+    console.log({
+        name: leadData.firstName,
+        phone: phoneNumber,
+        email: leadData.email,
+        address: leadData.address,
+        monthlyBill: leadData.electricalBill,
+        timestamp: leadData.timestamp
+    });
     console.log('----------------------------');
 }
 
-// Save lead to email (100% reliable)
+// Enhanced email saving with retry logic
+async function saveLeadWithRetry(leadData, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            await saveLeadToEmail(leadData);
+            console.log('📧 Lead saved to email successfully!');
+            return;
+        } catch (error) {
+            console.error(`❌ Email save attempt ${i + 1} failed:`, error.message);
+            if (i === retries - 1) {
+                // Final attempt failed - log to console as backup
+                console.error('🚨 CRITICAL: Email save failed completely. Lead data:');
+                console.error(JSON.stringify(leadData, null, 2));
+            } else {
+                await sleep(2000); // Wait before retry
+            }
+        }
+    }
+}
+
+// Enhanced email content
 async function saveLeadToEmail(leadData) {
-    try {
-        const emailContent = `
-🎉 NEW LEAD CAPTURED via WhatsApp Bot!
+    const emailContent = `
+🎉 NEW SOLAR LEAD CAPTURED!
 
 👤 Customer Details:
 • Name: ${leadData.firstName}
@@ -213,41 +381,73 @@ async function saveLeadToEmail(leadData) {
 • Email: ${leadData.email}
 • Address: ${leadData.address}
 • Monthly Bill: ${leadData.electricalBill}
-• Date: ${new Date().toLocaleString()}
+• Date: ${new Date(leadData.timestamp).toLocaleString('en-ZA')}
 
-💡 Follow up with this customer within 24 hours for best conversion!
+💡 Priority: Follow up within 24 hours for best conversion!
+📞 Customer expects contact soon.
 
 ---
-End Loadshedding Pty WhatsApp Bot
-        `;
+${CONFIG.COMPANY_NAME} WhatsApp Bot
+Generated: ${new Date().toLocaleString('en-ZA')}
+    `;
 
-        await transporter.sendMail({
-            from: CONFIG.EMAIL_USER,
-            to: CONFIG.SALES_EMAIL,
-            subject: `🚨 New WhatsApp Lead: ${leadData.firstName} - ${leadData.electricalBill}`,
-            text: emailContent
-        });
+    const htmlContent = `
+<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+    <h2 style="color: #2E8B57;">🎉 NEW SOLAR LEAD CAPTURED!</h2>
+    
+    <div style="background: #f5f5f5; padding: 20px; border-radius: 8px; margin: 20px 0;">
+        <h3 style="color: #333;">👤 Customer Details:</h3>
+        <ul style="list-style: none; padding: 0;">
+            <li style="margin: 8px 0;"><strong>Name:</strong> ${leadData.firstName}</li>
+            <li style="margin: 8px 0;"><strong>Phone:</strong> <a href="tel:${leadData.phoneNumber}" style="color: #2E8B57;">${leadData.phoneNumber}</a></li>
+            <li style="margin: 8px 0;"><strong>Email:</strong> <a href="mailto:${leadData.email}" style="color: #2E8B57;">${leadData.email}</a></li>
+            <li style="margin: 8px 0;"><strong>Address:</strong> ${leadData.address}</li>
+            <li style="margin: 8px 0;"><strong>Monthly Bill:</strong> <span style="color: #d9534f; font-weight: bold;">${leadData.electricalBill}</span></li>
+            <li style="margin: 8px 0;"><strong>Date:</strong> ${new Date(leadData.timestamp).toLocaleString('en-ZA')}</li>
+        </ul>
+    </div>
+    
+    <div style="background: #d4edda; padding: 15px; border-radius: 8px; border-left: 4px solid #28a745;">
+        <p style="margin: 0; font-weight: bold; color: #155724;">💡 Priority: Follow up within 24 hours for best conversion!</p>
+        <p style="margin: 5px 0 0 0; color: #155724;">📞 Customer expects contact soon.</p>
+    </div>
+    
+    <hr style="margin: 20px 0;">
+    <p style="color: #666; font-size: 12px;">
+        <em>${CONFIG.COMPANY_NAME} WhatsApp Bot<br>
+        Generated: ${new Date().toLocaleString('en-ZA')}</em>
+    </p>
+</div>
+    `;
 
-        console.log('📧 Lead saved to email successfully!');
-    } catch (error) {
-        console.error('❌ Email save failed:', error.message);
-    }
+    await transporter.sendMail({
+        from: `"${CONFIG.COMPANY_NAME} Bot" <${CONFIG.EMAIL_USER}>`,
+        to: CONFIG.SALES_EMAIL,
+        cc: CONFIG.EMAIL_USER, // CC to the bot email for records
+        subject: `🚨 NEW SOLAR LEAD: ${leadData.firstName} - ${leadData.electricalBill} monthly bill`,
+        text: emailContent,
+        html: htmlContent
+    });
 }
 
-// Send follow-up with direct WhatsApp redirect
+// Enhanced follow-up message
 async function sendFollowUpMessage(phoneNumber, firstName) {
     try {
-        await sleep(2000);
+        await sleep(CONFIG.RESPONSE_DELAY);
         
         const urgentMessage = `${firstName}, need an urgent quote? 🚀
 
-💬 WhatsApp our sales team directly:
-*+27 84 336 0063*
+Our sales team is standing by!
 
-Click this link:
-https://wa.me/27843360063?text=Hi%2C%20I%27m%20${encodeURIComponent(firstName)}%20and%20I%20need%20a%20solar%20quote
+💬 *WhatsApp for instant quotes:*
+${CONFIG.SALES_PHONE}
 
-⚡ *Available now for instant quotes!*`;
+🔗 *Quick contact link:*
+https://wa.me/27843360063?text=Hi%2C%20I%27m%20${encodeURIComponent(firstName)}%20and%20I%20need%20an%20urgent%20solar%20quote
+
+⚡ *Available now for same-day quotes!*
+
+🌞 Beat loadshedding with solar power!`;
 
         await sendMessage(phoneNumber, urgentMessage);
         console.log(`💬 Follow-up sent to ${phoneNumber}`);
@@ -257,32 +457,63 @@ https://wa.me/27843360063?text=Hi%2C%20I%27m%20${encodeURIComponent(firstName)}%
     }
 }
 
-// Send WhatsApp message
-async function sendMessage(phoneNumber, message) {
-    try {
-        await axios.post(
-            `https://graph.facebook.com/v20.0/${CONFIG.WHATSAPP_PHONE_ID}/messages`,
-            {
-                messaging_product: 'whatsapp',
-                to: phoneNumber,
-                text: { body: message }
-            },
-            {
-                headers: {
-                    'Authorization': `Bearer ${CONFIG.WHATSAPP_TOKEN}`,
-                    'Content-Type': 'application/json'
+// Help message
+async function sendHelpMessage(phoneNumber) {
+    const helpMsg = `🆘 *Need Help?*
+
+*Commands:*
+• Type 'restart' to start over
+• Type 'help' for this message
+
+*What we need:*
+1. Valid email address
+2. Your first name  
+3. Installation address
+4. Monthly electricity bill amount
+
+*Having issues?*
+Contact us directly: ${CONFIG.SALES_PHONE}
+
+*Email us:* ${CONFIG.SALES_EMAIL}`;
+    
+    await sendMessage(phoneNumber, helpMsg);
+}
+
+// Enhanced message sender with retry logic
+async function sendMessage(phoneNumber, message, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            await axios.post(
+                `https://graph.facebook.com/v20.0/${CONFIG.WHATSAPP_PHONE_ID}/messages`,
+                {
+                    messaging_product: 'whatsapp',
+                    to: phoneNumber,
+                    text: { body: message },
+                    type: 'text'
+                },
+                {
+                    headers: {
+                        'Authorization': `Bearer ${CONFIG.WHATSAPP_TOKEN}`,
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: 10000
                 }
+            );
+            console.log(`✅ Message sent to ${phoneNumber}`);
+            return;
+        } catch (error) {
+            console.error(`❌ Send attempt ${i + 1} failed:`, error.response?.data || error.message);
+            if (i < retries - 1) {
+                await sleep(1000); // Wait before retry
             }
-        );
-        console.log(`✅ Message sent to ${phoneNumber}`);
-    } catch (error) {
-        console.error('❌ Send error:', error.response?.data || error.message);
+        }
     }
 }
 
-// Email validation
+// Enhanced email validation
 function isValidEmail(email) {
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    const emailRegex = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+    return emailRegex.test(email) && email.length <= 254;
 }
 
 // Sleep function
@@ -290,20 +521,42 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Health check
+// Enhanced health check
 app.get('/health', (req, res) => {
-    res.json({
+    const stats = {
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        leads_today: 'Check your email for leads!'
+        uptime: process.uptime(),
+        activeSessions: userSessions.size,
+        environment: process.env.NODE_ENV || 'development',
+        version: '2.0.0'
+    };
+    
+    res.json(stats);
+});
+
+// Stats endpoint
+app.get('/stats', (req, res) => {
+    res.json({
+        activeSessions: userSessions.size,
+        totalMemoryUsage: process.memoryUsage(),
+        uptime: process.uptime()
     });
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('🛑 Received SIGTERM, shutting down gracefully...');
+    process.exit(0);
 });
 
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log('🤖 End Loadshedding Chatbot is running!');
+    console.log(`🤖 ${CONFIG.COMPANY_NAME} Chatbot v2.0 is running!`);
     console.log(`📡 Server: http://localhost:${PORT}`);
     console.log(`🔗 Webhook: https://your-app-url.com/webhook`);
-    console.log('💡 All leads will be emailed to you!');
+    console.log(`📧 Leads sent to: ${CONFIG.SALES_EMAIL}`);
+    console.log(`📞 Sales WhatsApp: ${CONFIG.SALES_PHONE}`);
+    console.log('💡 Ready to capture solar leads!');
 });
