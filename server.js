@@ -504,9 +504,7 @@ async function completeLeadCapture(phoneNumber, leadData) {
 📍 Address: ${leadData.address}
 💡 Monthly Bill: ${leadData.electricalBill}
 
-🎯 *Our specialist will contact you within 24 hours!*
-
-🌞 Get ready to save money and beat loadshedding!`;
+🎯 *Our specialist will contact you within 24 hours!*`;
 
     await sendMessage(phoneNumber, summaryMessage);
     
