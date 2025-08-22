@@ -4,15 +4,10 @@ const app = express();
 
 // Only load optional dependencies if available
 let nodemailer, rateLimit, helmet;
-let emailEnabled = false;
+let emailEnabled = false; // Force disable email for now
 
-try {
-    nodemailer = require('nodemailer');
-    emailEnabled = true;
-    console.log('✅ Nodemailer loaded successfully');
-} catch (error) {
-    console.log('⚠️ Nodemailer not available, email features disabled');
-}
+// Temporarily disable email to fix WhatsApp functionality
+console.log('📧 Email temporarily disabled to ensure WhatsApp functionality');
 
 try {
     rateLimit = require('express-rate-limit');
@@ -84,37 +79,10 @@ for (const envVar of requiredEnvVars) {
     }
 }
 
-// Email transporter setup (only if nodemailer is available)
-let transporter;
-if (emailEnabled && nodemailer) {
-    try {
-        transporter = nodemailer.createTransport({
-            service: 'gmail',
-            auth: {
-                user: CONFIG.EMAIL_USER,
-                pass: CONFIG.EMAIL_PASS
-            },
-            pool: true,
-            maxConnections: 5,
-            maxMessages: 100
-        });
-
-        // Verify email configuration on startup
-        transporter.verify((error, success) => {
-            if (error) {
-                console.error('❌ Email configuration error:', error.message);
-                emailEnabled = false;
-                transporter = null; // Disable transporter
-            } else {
-                console.log('✅ Email server is ready');
-            }
-        });
-    } catch (error) {
-        console.error('❌ Failed to create email transporter:', error.message);
-        emailEnabled = false;
-        transporter = null;
-    }
-}
+// Email transporter setup - DISABLED FOR NOW
+let transporter = null;
+emailEnabled = false;
+console.log('📧 Email functionality disabled - leads will be logged to console');
 
 // Webhook verification
 app.get('/webhook', (req, res) => {
