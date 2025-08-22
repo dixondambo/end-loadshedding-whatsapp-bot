@@ -32,9 +32,12 @@ try {
 
 app.use(express.json({ limit: '10mb' }));
 
-// User sessions storage with cleanup
+// User sessions storage with cleanup and follow-up tracking
 const userSessions = new Map();
+const followUpTimers = new Map();
 const SESSION_TIMEOUT = 30 * 60 * 1000; // 30 minutes
+const FOLLOW_UP_DELAY = 10 * 60 * 1000; // 10 minutes
+const MESSAGE_STATUS_CHECK_DELAY = 2 * 60 * 1000; // 2 minutes to check delivery status
 
 // Clean up old sessions every hour
 setInterval(() => {
@@ -42,6 +45,11 @@ setInterval(() => {
     for (const [key, session] of userSessions.entries()) {
         if (now - session.lastActivity > SESSION_TIMEOUT) {
             userSessions.delete(key);
+            // Clear any pending follow-up timers
+            if (followUpTimers.has(key)) {
+                clearTimeout(followUpTimers.get(key));
+                followUpTimers.delete(key);
+            }
         }
     }
 }, 60 * 60 * 1000);
@@ -60,9 +68,12 @@ const CONFIG = {
     // Business settings
     SALES_PHONE: '+27843360063',
     COMPANY_NAME: 'End Loadshedding Pty Ltd',
+    BUSINESS_EMAIL: 'sales@endloadshedding.com',
+    BUSINESS_ADDRESS: 'Shop 4, 135 Main Rd, Somerset West, Cape Town, 7130',
+    BUSINESS_WEBSITE: 'www.endloads.co.za',
     RESPONSE_DELAY: 2000,
     MIN_BILL_AMOUNT: 200,
-    MAX_BILL_AMOUNT: 50000
+    MAX_BILL_AMOUNT: 100000
 };
 
 // Validate required environment variables
@@ -131,10 +142,19 @@ app.post('/webhook', async (req, res) => {
             
             body.entry.forEach((entry) => {
                 entry.changes.forEach((change) => {
-                    if (change.field === 'messages' && change.value.messages) {
-                        change.value.messages.forEach((message) => {
-                            promises.push(handleMessage(message));
-                        });
+                    if (change.field === 'messages') {
+                        // Handle incoming messages
+                        if (change.value.messages) {
+                            change.value.messages.forEach((message) => {
+                                promises.push(handleMessage(message));
+                            });
+                        }
+                        // Handle message status updates (delivery, read receipts)
+                        if (change.value.statuses) {
+                            change.value.statuses.forEach((status) => {
+                                promises.push(handleMessageStatus(status));
+                            });
+                        }
                     }
                 });
             });
@@ -150,7 +170,123 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
-// Enhanced message handler with better flow control
+// Handle message status updates (delivery, read receipts)
+async function handleMessageStatus(status) {
+    try {
+        const phoneNumber = status.recipient_id;
+        const messageId = status.id;
+        const statusType = status.status; // sent, delivered, read, failed
+        
+        console.log(`📊 Message status update: ${messageId} -> ${statusType} for ${phoneNumber}`);
+        
+        const session = userSessions.get(phoneNumber);
+        if (session && session.followUps.pendingMessages.has(messageId)) {
+            session.followUps.pendingMessages.set(messageId, {
+                ...session.followUps.pendingMessages.get(messageId),
+                status: statusType,
+                statusTime: Date.now()
+            });
+            
+            // If message is delivered (two ticks), schedule follow-up check
+            if (statusType === 'delivered' || statusType === 'read') {
+                scheduleFollowUp(phoneNumber, session);
+            }
+        }
+    } catch (error) {
+        console.error('❌ Message status handling error:', error);
+    }
+}
+
+// Schedule follow-up for inactive users
+function scheduleFollowUp(phoneNumber, session) {
+    // Don't schedule if user already completed the flow or is dead lead
+    if (session.step === 'completed' || session.followUps.count >= 3) {
+        return;
+    }
+    
+    // Clear any existing timer
+    if (followUpTimers.has(phoneNumber)) {
+        clearTimeout(followUpTimers.get(phoneNumber));
+    }
+    
+    const timer = setTimeout(async () => {
+        await sendFollowUpSequence(phoneNumber, session);
+    }, FOLLOW_UP_DELAY);
+    
+    followUpTimers.set(phoneNumber, timer);
+    console.log(`⏰ Follow-up scheduled for ${phoneNumber} in ${FOLLOW_UP_DELAY / 60000} minutes`);
+}
+
+// Send follow-up message sequence
+async function sendFollowUpSequence(phoneNumber, session) {
+    try {
+        // Check if user has responded since we scheduled this follow-up
+        const now = Date.now();
+        if (now - session.lastActivity < FOLLOW_UP_DELAY) {
+            console.log(`⏭️ User ${phoneNumber} has responded recently, skipping follow-up`);
+            return;
+        }
+        
+        // Check if it's been more than 24 hours since first follow-up
+        if (session.followUps.lastFollowUp && 
+            now - session.followUps.lastFollowUp > 24 * 60 * 60 * 1000) {
+            console.log(`💀 Marking ${phoneNumber} as dead lead (24h+ inactive)`);
+            session.step = 'dead_lead';
+            return;
+        }
+        
+        session.followUps.count++;
+        session.followUps.lastFollowUp = now;
+        
+        let followUpMessage = '';
+        
+        switch (session.followUps.count) {
+            case 1:
+                followUpMessage = getFollowUpMessage1(session);
+                break;
+            case 2:
+                followUpMessage = getFollowUpMessage2(session);
+                break;
+            case 3:
+                followUpMessage = getFollowUpMessage3(session);
+                break;
+            default:
+                // After 3 follow-ups, mark as dead lead
+                console.log(`💀 Marking ${phoneNumber} as dead lead after 3 follow-ups`);
+                session.step = 'dead_lead';
+                return;
+        }
+        
+        console.log(`📤 Sending follow-up ${session.followUps.count} to ${phoneNumber}`);
+        await sendMessageWithTracking(phoneNumber, followUpMessage, session);
+        
+        // Update session
+        userSessions.set(phoneNumber, session);
+        
+    } catch (error) {
+        console.error('❌ Follow-up sequence error:', error);
+    }
+}
+
+// Follow-up message templates
+function getFollowUpMessage1(session) {
+    const stepMessages = {
+        'email': "Still waiting on the request above.",
+        'firstName': "Still waiting on the request above.",
+        'address': "Still waiting on the request above.",
+        'electricalBill': "Still waiting on the request above."
+    };
+    
+    return stepMessages[session.step] || "Still waiting on the request above.";
+}
+
+function getFollowUpMessage2(session) {
+    return "Hi are you still there?";
+}
+
+function getFollowUpMessage3(session) {
+    return "I'm still here to help you get started with solar. ☀️";
+}
 async function handleMessage(message) {
     try {
         const phoneNumber = message.from;
@@ -168,16 +304,75 @@ async function handleMessage(message) {
             step: 'welcome',
             data: {},
             lastActivity: Date.now(),
-            attempts: {}
+            attempts: {},
+            followUps: {
+                count: 0,
+                lastFollowUp: null,
+                pendingMessages: new Map() // messageId -> {timestamp, status}
+            },
+            quotationFollowUp: {
+                scheduled: false,
+                completed: false,
+                responseReceived: false
+            }
         };
 
-        // Update last activity
+        // Update last activity and clear any pending follow-ups
         session.lastActivity = Date.now();
+        
+        // Clear follow-up timer since user responded
+        if (followUpTimers.has(phoneNumber)) {
+            clearTimeout(followUpTimers.get(phoneNumber));
+            followUpTimers.delete(phoneNumber);
+        }
 
         console.log(`👤 Current session step: ${session.step}`);
 
-        // Handle commands at any time
-        const lowerText = messageText.toLowerCase();
+        // Handle business information requests
+        if (lowerText.includes('email') && (lowerText.includes('your') || lowerText.includes('business') || lowerText.includes('contact'))) {
+            await sendMessage(phoneNumber, `Our business email is: ${CONFIG.BUSINESS_EMAIL}`);
+            userSessions.set(phoneNumber, session);
+            return;
+        }
+        
+        if (lowerText.includes('address') && (lowerText.includes('your') || lowerText.includes('business') || lowerText.includes('physical') || lowerText.includes('office'))) {
+            await sendMessage(phoneNumber, `Our address is: ${CONFIG.BUSINESS_ADDRESS}`);
+            userSessions.set(phoneNumber, session);
+            return;
+        }
+        
+        if (lowerText.includes('website') || lowerText.includes('web site') || lowerText.includes('site')) {
+            await sendMessage(phoneNumber, `Our website is: ${CONFIG.BUSINESS_WEBSITE}`);
+            userSessions.set(phoneNumber, session);
+            return;
+        }
+        
+        // Handle installation area questions
+        if ((lowerText.includes('install') || lowerText.includes('service')) && 
+            (lowerText.includes('area') || lowerText.includes('city') || lowerText.includes('town') || 
+             lowerText.includes('region') || lowerText.includes('province') || lowerText.includes('where') ||
+             lowerText.includes('durban') || lowerText.includes('joburg') || lowerText.includes('johannesburg') || 
+             lowerText.includes('pretoria') || lowerText.includes('cape town') || lowerText.includes('bloemfontein') ||
+             lowerText.includes('port elizabeth') || lowerText.includes('nelspruit') || lowerText.includes('polokwane'))) {
+            await sendMessage(phoneNumber, `Yes! We install anywhere in South Africa 🇿🇦 The installation and travel costs are included in your quote. Contact ${CONFIG.SALES_PHONE} for your personalized quote.`);
+            userSessions.set(phoneNumber, session);
+            return;
+        }
+        
+        // Handle quotation follow-up responses
+        if (session.quotationFollowUp.scheduled && !session.quotationFollowUp.responseReceived) {
+            if (lowerText.includes('yes') || lowerText.includes('received') || lowerText.includes('got')) {
+                session.quotationFollowUp.responseReceived = true;
+                session.quotationFollowUp.completed = true;
+                await sendMessage(phoneNumber, `Great! 🎉 Before making your decision, feel free to check out our customer reviews at https://www.hellopeter.com/endloadsheddingcom to see what others say about our solar installations.`);
+                userSessions.set(phoneNumber, session);
+                return;
+            } else if (lowerText.includes('no') || lowerText.includes('not') || lowerText.includes('haven')) {
+                await sendMessage(phoneNumber, `No problem! Please contact ${CONFIG.SALES_PHONE} directly and they'll ensure you receive your quotation promptly. Sometimes quotes may go to spam folders, so please check there too.`);
+                userSessions.set(phoneNumber, session);
+                return;
+            }
+        }
         if (lowerText.includes('restart') || lowerText.includes('start over')) {
             session.step = 'welcome';
             session.data = {};
@@ -228,7 +423,12 @@ async function processStep(phoneNumber, messageText, session) {
             break;
 
         case 'completed':
-            await sendMessage(phoneNumber, `Hi ${session.data.firstName}! A sales specialist will contact you soon. 😊\n\nFor urgent quotes, WhatsApp us: ${CONFIG.SALES_PHONE}`);
+            await sendMessage(phoneNumber, `WhatsApp your details to ${CONFIG.SALES_PHONE} ASAP....he will advise and send you a quote.`);
+            break;
+
+        case 'dead_lead':
+            // Don't respond to dead leads
+            console.log(`💀 Ignoring message from dead lead: ${phoneNumber}`);
             break;
 
         default:
@@ -240,15 +440,11 @@ async function processStep(phoneNumber, messageText, session) {
 
 // Welcome message
 async function sendWelcomeMessage(phoneNumber) {
-    const welcomeMsg = `🔋 *Welcome to ${CONFIG.COMPANY_NAME} Chatbot!*
+    const welcomeMsg = `🔋 *Welcome to End Loadshedding Pty Chatbot!*
 
-Transform your home with solar power and say goodbye to loadshedding! 🌞
+Before I connect you to a Customer Support Specialist.
 
-Before connecting you to our specialists, I need some quick info.
-
-Please share your best email address: 📧
-
-_Type 'help' for assistance or 'restart' to start over_`;
+Could you please share your best email address? 📧`;
     
     await sendMessage(phoneNumber, welcomeMsg);
 }
@@ -321,8 +517,8 @@ async function handleElectricalBillStep(phoneNumber, messageText, session) {
         return;
     }
     
-    // Enhanced number extraction
-    const numberMatch = messageText.match(/(?:r\s*)?(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2})?)/i);
+    // Enhanced number extraction - fix for large numbers
+    const numberMatch = messageText.match(/(?:r\s*)?(\d{1,6}(?:[,\s]\d{3})*(?:\.\d{2})?)/i);
     if (!numberMatch) {
         session.attempts.bill = (session.attempts.bill || 0) + 1;
         
@@ -335,7 +531,14 @@ async function handleElectricalBillStep(phoneNumber, messageText, session) {
         return;
     }
     
-    const billAmount = parseInt(numberMatch[1].replace(/[,\s]/g, ''));
+    // Fix: Handle large numbers properly - don't remove commas/spaces until after extraction
+    let billAmount = parseInt(numberMatch[1].replace(/[,\s]/g, ''));
+    
+    // Handle case where user types something like "22500" but we extracted "225"
+    const originalNumber = messageText.match(/\d+/g)?.join('') || '';
+    if (originalNumber.length >= 3) {
+        billAmount = parseInt(originalNumber);
+    }
     
     if (billAmount < CONFIG.MIN_BILL_AMOUNT || billAmount > CONFIG.MAX_BILL_AMOUNT) {
         await sendMessage(phoneNumber, `Please double-check your monthly bill amount:\n\n• Should be between R${CONFIG.MIN_BILL_AMOUNT} - R${CONFIG.MAX_BILL_AMOUNT}\n• Check your latest bill for the exact amount`);
@@ -378,6 +581,11 @@ async function completeLeadCapture(phoneNumber, leadData) {
     setTimeout(async () => {
         await sendFollowUpMessage(phoneNumber, leadData.firstName);
     }, 120000);
+    
+    // Schedule 24-hour quotation follow-up
+    setTimeout(async () => {
+        await sendQuotationFollowUp(phoneNumber, leadData.firstName);
+    }, 24 * 60 * 60 * 1000); // 24 hours
     
     // Enhanced logging
     console.log('🎉 NEW LEAD CAPTURED:');
@@ -450,24 +658,56 @@ Generated: ${new Date().toLocaleString('en-ZA')}
     });
 }
 
-// Enhanced follow-up message
+// Send 24-hour quotation follow-up
+async function sendQuotationFollowUp(phoneNumber, firstName) {
+    try {
+        const session = userSessions.get(phoneNumber);
+        if (!session || session.quotationFollowUp.completed) {
+            return; // Don't send if session expired or already completed
+        }
+        
+        session.quotationFollowUp.scheduled = true;
+        
+        const quotationMessage = `Hi ${firstName}! 📋
+
+It's been 24 hours since we captured your details. Have you received your solar quotation yet?
+
+Please reply:
+• "Yes" if you received it
+• "No" if you haven't received it
+
+We're here to help! 🌞`;
+
+        await sendMessage(phoneNumber, quotationMessage);
+        userSessions.set(phoneNumber, session);
+        
+        // Schedule follow-up if no response in 2 hours
+        setTimeout(async () => {
+            const updatedSession = userSessions.get(phoneNumber);
+            if (updatedSession && updatedSession.quotationFollowUp.scheduled && 
+                !updatedSession.quotationFollowUp.responseReceived) {
+                
+                const reminderMessage = `${firstName}, just checking if you received your solar quote? 
+
+If you haven't, please contact ${CONFIG.SALES_PHONE} directly for immediate assistance.`;
+                
+                await sendMessage(phoneNumber, reminderMessage);
+            }
+        }, 2 * 60 * 60 * 1000); // 2 hours later
+        
+        console.log(`📋 24-hour quotation follow-up sent to ${phoneNumber}`);
+        
+    } catch (error) {
+        console.error('❌ Quotation follow-up failed:', error.message);
+    }
+}
 async function sendFollowUpMessage(phoneNumber, firstName) {
     try {
         await sleep(CONFIG.RESPONSE_DELAY);
         
         const urgentMessage = `${firstName}, need an urgent quote? 🚀
 
-Our sales team is standing by!
-
-💬 *WhatsApp for instant quotes:*
-${CONFIG.SALES_PHONE}
-
-🔗 *Quick contact link:*
-https://wa.me/27843360063?text=Hi%2C%20I%27m%20${encodeURIComponent(firstName)}%20and%20I%20need%20an%20urgent%20solar%20quote
-
-⚡ *Available now for same-day quotes!*
-
-🌞 Beat loadshedding with solar power!`;
+WhatsApp your details to ${CONFIG.SALES_PHONE} ASAP....he will advise and send you a quote.`;
 
         await sendMessage(phoneNumber, urgentMessage);
         console.log(`💬 Follow-up sent to ${phoneNumber}`);
@@ -485,22 +725,31 @@ async function sendHelpMessage(phoneNumber) {
 • Type 'restart' to start over
 • Type 'help' for this message
 
+*Business Information:*
+• Email: ${CONFIG.BUSINESS_EMAIL}
+• Address: ${CONFIG.BUSINESS_ADDRESS}
+• Website: ${CONFIG.BUSINESS_WEBSITE}
+• Phone: ${CONFIG.SALES_PHONE}
+
+*Coverage:* We install anywhere in South Africa 🇿🇦
+
 *What we need:*
 1. Valid email address
 2. Your first name  
 3. Installation address
-4. Monthly electricity bill amount
-
-*Having issues?*
-Contact us directly: ${CONFIG.SALES_PHONE}
-
-*Email us:* ${CONFIG.SALES_EMAIL}`;
+4. Monthly electricity bill amount`;
     
     await sendMessage(phoneNumber, helpMsg);
 }
 
-// Enhanced message sender with retry logic
+// Enhanced message sender with delivery tracking
 async function sendMessage(phoneNumber, message, retries = 3) {
+    const session = userSessions.get(phoneNumber);
+    return await sendMessageWithTracking(phoneNumber, message, session, retries);
+}
+
+// Send message with delivery tracking
+async function sendMessageWithTracking(phoneNumber, message, session, retries = 3) {
     console.log(`📤 Attempting to send message to ${phoneNumber}`);
     
     for (let i = 0; i < retries; i++) {
@@ -521,8 +770,27 @@ async function sendMessage(phoneNumber, message, retries = 3) {
                     timeout: 10000
                 }
             );
-            console.log(`✅ Message sent to ${phoneNumber}`);
-            return;
+            
+            const messageId = response.data?.messages?.[0]?.id;
+            if (messageId && session) {
+                // Track this message for delivery status
+                session.followUps.pendingMessages.set(messageId, {
+                    timestamp: Date.now(),
+                    status: 'sent',
+                    message: message.substring(0, 100) // Store first 100 chars for reference
+                });
+                
+                // Schedule follow-up check after message status delay
+                setTimeout(() => {
+                    const msgStatus = session.followUps.pendingMessages.get(messageId);
+                    if (msgStatus && (msgStatus.status === 'delivered' || msgStatus.status === 'read')) {
+                        scheduleFollowUp(phoneNumber, session);
+                    }
+                }, MESSAGE_STATUS_CHECK_DELAY);
+            }
+            
+            console.log(`✅ Message sent to ${phoneNumber}${messageId ? ` (ID: ${messageId})` : ''}`);
+            return messageId;
         } catch (error) {
             console.error(`❌ Send attempt ${i + 1} failed:`, error.response?.data || error.message);
             if (i < retries - 1) {
@@ -531,6 +799,7 @@ async function sendMessage(phoneNumber, message, retries = 3) {
         }
     }
     console.error(`🚨 Failed to send message to ${phoneNumber} after ${retries} attempts`);
+    return null;
 }
 
 // Enhanced email validation
@@ -564,8 +833,24 @@ app.get('/health', (req, res) => {
 
 // Stats endpoint
 app.get('/stats', (req, res) => {
+    const activeFollowUps = Array.from(userSessions.values()).filter(session => 
+        session.followUps.count > 0 && session.step !== 'completed' && session.step !== 'dead_lead'
+    ).length;
+    
+    const deadLeads = Array.from(userSessions.values()).filter(session => 
+        session.step === 'dead_lead'
+    ).length;
+    
+    const completedLeads = Array.from(userSessions.values()).filter(session => 
+        session.step === 'completed'
+    ).length;
+    
     res.json({
         activeSessions: userSessions.size,
+        activeFollowUps: activeFollowUps,
+        deadLeads: deadLeads,
+        completedLeads: completedLeads,
+        pendingFollowUpTimers: followUpTimers.size,
         totalMemoryUsage: process.memoryUsage(),
         uptime: process.uptime(),
         emailEnabled
