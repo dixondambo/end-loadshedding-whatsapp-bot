@@ -2,29 +2,6 @@ const express = require('express');
 const axios = require('axios');
 const app = express();
 
-// Only load optional dependencies if available
-let nodemailer, rateLimit, helmet;
-let emailEnabled = false; // Force disable email for now
-
-// Temporarily disable email to fix WhatsApp functionality
-console.log('📧 Email temporarily disabled to ensure WhatsApp functionality');
-
-try {
-    rateLimit = require('express-rate-limit');
-    helmet = require('helmet');
-    
-    // Apply security middleware only if available
-    const limiter = rateLimit({
-        windowMs: 15 * 60 * 1000, // 15 minutes
-        max: 100 // limit each IP to 100 requests per windowMs
-    });
-    app.use(limiter);
-    app.use(helmet());
-    console.log('✅ Security middleware loaded');
-} catch (error) {
-    console.log('⚠️ Security middleware not available, using basic setup');
-}
-
 app.use(express.json({ limit: '10mb' }));
 
 // User sessions storage with cleanup and follow-up tracking
@@ -49,16 +26,12 @@ setInterval(() => {
     }
 }, 60 * 60 * 1000);
 
-// Configuration with better environment handling
+// Configuration
 const CONFIG = {
     WHATSAPP_TOKEN: process.env.WHATSAPP_TOKEN || '',
     WHATSAPP_PHONE_ID: process.env.WHATSAPP_PHONE_ID || '768489836345252',
     WEBHOOK_VERIFY_TOKEN: process.env.WEBHOOK_VERIFY_TOKEN || 'EndLoadshedding2024',
-    SALES_EMAIL: process.env.SALES_EMAIL || 'endloadshedding@gmail.com',
-    
-    // Updated email configuration
-    EMAIL_USER: process.env.EMAIL_USER || 'endloadshedding@gmail.com',
-    EMAIL_PASS: process.env.EMAIL_PASS || '@20endloadshedding',
+    SALES_EMAIL: process.env.SALES_EMAIL || 'sales@endloadshedding.com',
     
     // Business settings
     SALES_PHONE: '+27843360063',
@@ -78,11 +51,6 @@ for (const envVar of requiredEnvVars) {
         console.warn(`⚠️  Warning: ${envVar} not set in environment variables`);
     }
 }
-
-// Email transporter setup - DISABLED FOR NOW
-let transporter = null;
-emailEnabled = false;
-console.log('📧 Email functionality disabled - leads will be logged to console');
 
 // Webhook verification
 app.get('/webhook', (req, res) => {
@@ -139,6 +107,125 @@ app.post('/webhook', async (req, res) => {
         res.status(500).send('Error');
     }
 });
+
+// Enhanced message handler with better flow control
+async function handleMessage(message) {
+    try {
+        const phoneNumber = message.from;
+        const messageText = message.text?.body?.trim() || '';
+        
+        console.log(`📱 Processing message from ${phoneNumber}: "${messageText}"`);
+        
+        // Skip empty messages or system messages
+        if (!messageText || message.type !== 'text') {
+            console.log('⏭️ Skipping non-text or empty message');
+            return;
+        }
+
+        let session = userSessions.get(phoneNumber) || {
+            step: 'welcome',
+            data: {},
+            lastActivity: Date.now(),
+            attempts: {},
+            followUps: {
+                count: 0,
+                lastFollowUp: null,
+                pendingMessages: new Map() // messageId -> {timestamp, status}
+            },
+            quotationFollowUp: {
+                scheduled: false,
+                completed: false,
+                responseReceived: false
+            }
+        };
+
+        // Update last activity and clear any pending follow-ups
+        session.lastActivity = Date.now();
+        
+        // Clear follow-up timer since user responded
+        if (followUpTimers.has(phoneNumber)) {
+            clearTimeout(followUpTimers.get(phoneNumber));
+            followUpTimers.delete(phoneNumber);
+        }
+
+        console.log(`👤 Current session step: ${session.step}`);
+
+        // Handle business information requests
+        if (messageText.includes('email') && (messageText.includes('your') || messageText.includes('business') || messageText.includes('contact'))) {
+            await sendMessage(phoneNumber, `Our business email is: ${CONFIG.BUSINESS_EMAIL}`);
+            userSessions.set(phoneNumber, session);
+            return;
+        }
+        
+        if (messageText.includes('address') && (messageText.includes('your') || messageText.includes('business') || messageText.includes('physical') || messageText.includes('office'))) {
+            await sendMessage(phoneNumber, `Our address is: ${CONFIG.BUSINESS_ADDRESS}`);
+            userSessions.set(phoneNumber, session);
+            return;
+        }
+        
+        if (messageText.includes('website') || messageText.includes('web site') || messageText.includes('site')) {
+            await sendMessage(phoneNumber, `Our website is: ${CONFIG.BUSINESS_WEBSITE}`);
+            userSessions.set(phoneNumber, session);
+            return;
+        }
+        
+        // Handle installation area questions
+        if ((messageText.includes('install') || messageText.includes('service')) && 
+            (messageText.includes('area') || messageText.includes('city') || messageText.includes('town') || 
+             messageText.includes('region') || messageText.includes('province') || messageText.includes('where') ||
+             messageText.includes('durban') || messageText.includes('joburg') || messageText.includes('johannesburg') || 
+             messageText.includes('pretoria') || messageText.includes('cape town') || messageText.includes('bloemfontein') ||
+             messageText.includes('port elizabeth') || messageText.includes('nelspruit') || messageText.includes('polokwane'))) {
+            await sendMessage(phoneNumber, `Yes! We install anywhere in South Africa 🇿🇦 The installation and travel costs are included in your quote. Contact ${CONFIG.SALES_PHONE} for your personalized quote.`);
+            userSessions.set(phoneNumber, session);
+            return;
+        }
+        
+        // Handle quotation follow-up responses
+        if (session.quotationFollowUp.scheduled && !session.quotationFollowUp.responseReceived) {
+            if (messageText.includes('yes') || messageText.includes('received') || messageText.includes('got')) {
+                session.quotationFollowUp.responseReceived = true;
+                session.quotationFollowUp.completed = true;
+                await sendMessage(phoneNumber, `Great! 🎉 Before making your decision, feel free to check out our customer reviews at https://www.hellopeter.com/endloadsheddingcom to see what others say about our solar installations.`);
+                userSessions.set(phoneNumber, session);
+                return;
+            } else if (messageText.includes('no') || messageText.includes('not') || messageText.includes('haven')) {
+                await sendMessage(phoneNumber, `No problem! Please contact ${CONFIG.SALES_PHONE} directly and they'll ensure you receive your quotation promptly. Sometimes quotes may go to spam folders, so please check there too.`);
+                userSessions.set(phoneNumber, session);
+                return;
+            }
+        }
+
+        // Handle restart/help commands
+        const lowerText = messageText.toLowerCase();
+        if (lowerText.includes('restart') || lowerText.includes('start over')) {
+            session.step = 'welcome';
+            session.data = {};
+            session.attempts = {};
+            session.followUps = { count: 0, lastFollowUp: null, pendingMessages: new Map() };
+            session.quotationFollowUp = { scheduled: false, completed: false, responseReceived: false };
+        } else if (lowerText.includes('help')) {
+            await sendHelpMessage(phoneNumber);
+            userSessions.set(phoneNumber, session);
+            return;
+        }
+
+        // Add realistic delay
+        await sleep(CONFIG.RESPONSE_DELAY);
+
+        await processStep(phoneNumber, messageText, session);
+        userSessions.set(phoneNumber, session);
+
+    } catch (error) {
+        console.error('❌ Message handling error:', error);
+        // Don't let errors crash the message handling
+        try {
+            await sendMessage(phoneNumber, "Sorry, something went wrong. Please type 'restart' to begin again.");
+        } catch (sendError) {
+            console.error('❌ Failed to send error message:', sendError);
+        }
+    }
+}
 
 // Handle message status updates (delivery, read receipts)
 async function handleMessageStatus(status) {
@@ -240,14 +327,7 @@ async function sendFollowUpSequence(phoneNumber, session) {
 
 // Follow-up message templates
 function getFollowUpMessage1(session) {
-    const stepMessages = {
-        'email': "Still waiting on the request above.",
-        'firstName': "Still waiting on the request above.",
-        'address': "Still waiting on the request above.",
-        'electricalBill': "Still waiting on the request above."
-    };
-    
-    return stepMessages[session.step] || "Still waiting on the request above.";
+    return "Still waiting on the request above.";
 }
 
 function getFollowUpMessage2(session) {
@@ -256,120 +336,6 @@ function getFollowUpMessage2(session) {
 
 function getFollowUpMessage3(session) {
     return "I'm still here to help you get started with solar. ☀️";
-}
-// Enhanced message handler with better flow control
-async function handleMessage(message) {
-    try {
-        const phoneNumber = message.from;
-        const messageText = message.text?.body?.trim() || '';
-        
-        console.log(`📱 Processing message from ${phoneNumber}: "${messageText}"`);
-        
-        // Skip empty messages or system messages
-        if (!messageText || message.type !== 'text') {
-            console.log('⏭️ Skipping non-text or empty message');
-            return;
-        }
-
-        let session = userSessions.get(phoneNumber) || {
-            step: 'welcome',
-            data: {},
-            lastActivity: Date.now(),
-            attempts: {},
-            followUps: {
-                count: 0,
-                lastFollowUp: null,
-                pendingMessages: new Map() // messageId -> {timestamp, status}
-            },
-            quotationFollowUp: {
-                scheduled: false,
-                completed: false,
-                responseReceived: false
-            }
-        };
-
-        // Update last activity and clear any pending follow-ups
-        session.lastActivity = Date.now();
-        
-        // Clear follow-up timer since user responded
-        if (followUpTimers.has(phoneNumber)) {
-            clearTimeout(followUpTimers.get(phoneNumber));
-            followUpTimers.delete(phoneNumber);
-        }
-
-        console.log(`👤 Current session step: ${session.step}`);
-
-        // Handle business information requests
-        if (lowerText.includes('email') && (lowerText.includes('your') || lowerText.includes('business') || lowerText.includes('contact'))) {
-            await sendMessage(phoneNumber, `Our business email is: ${CONFIG.BUSINESS_EMAIL}`);
-            userSessions.set(phoneNumber, session);
-            return;
-        }
-        
-        if (lowerText.includes('address') && (lowerText.includes('your') || lowerText.includes('business') || lowerText.includes('physical') || lowerText.includes('office'))) {
-            await sendMessage(phoneNumber, `Our address is: ${CONFIG.BUSINESS_ADDRESS}`);
-            userSessions.set(phoneNumber, session);
-            return;
-        }
-        
-        if (lowerText.includes('website') || lowerText.includes('web site') || lowerText.includes('site')) {
-            await sendMessage(phoneNumber, `Our website is: ${CONFIG.BUSINESS_WEBSITE}`);
-            userSessions.set(phoneNumber, session);
-            return;
-        }
-        
-        // Handle installation area questions
-        if ((lowerText.includes('install') || lowerText.includes('service')) && 
-            (lowerText.includes('area') || lowerText.includes('city') || lowerText.includes('town') || 
-             lowerText.includes('region') || lowerText.includes('province') || lowerText.includes('where') ||
-             lowerText.includes('durban') || lowerText.includes('joburg') || lowerText.includes('johannesburg') || 
-             lowerText.includes('pretoria') || lowerText.includes('cape town') || lowerText.includes('bloemfontein') ||
-             lowerText.includes('port elizabeth') || lowerText.includes('nelspruit') || lowerText.includes('polokwane'))) {
-            await sendMessage(phoneNumber, `Yes! We install anywhere in South Africa 🇿🇦 The installation and travel costs are included in your quote. Contact ${CONFIG.SALES_PHONE} for your personalized quote.`);
-            userSessions.set(phoneNumber, session);
-            return;
-        }
-        
-        // Handle quotation follow-up responses
-        if (session.quotationFollowUp.scheduled && !session.quotationFollowUp.responseReceived) {
-            if (lowerText.includes('yes') || lowerText.includes('received') || lowerText.includes('got')) {
-                session.quotationFollowUp.responseReceived = true;
-                session.quotationFollowUp.completed = true;
-                await sendMessage(phoneNumber, `Great! 🎉 Before making your decision, feel free to check out our customer reviews at https://www.hellopeter.com/endloadsheddingcom to see what others say about our solar installations.`);
-                userSessions.set(phoneNumber, session);
-                return;
-            } else if (lowerText.includes('no') || lowerText.includes('not') || lowerText.includes('haven')) {
-                await sendMessage(phoneNumber, `No problem! Please contact ${CONFIG.SALES_PHONE} directly and they'll ensure you receive your quotation promptly. Sometimes quotes may go to spam folders, so please check there too.`);
-                userSessions.set(phoneNumber, session);
-                return;
-            }
-        }
-        if (lowerText.includes('restart') || lowerText.includes('start over')) {
-            session.step = 'welcome';
-            session.data = {};
-            session.attempts = {};
-            console.log('🔄 Session restarted');
-        } else if (lowerText.includes('help')) {
-            await sendHelpMessage(phoneNumber);
-            userSessions.set(phoneNumber, session);
-            return;
-        }
-
-        // Add realistic delay
-        await sleep(CONFIG.RESPONSE_DELAY);
-
-        await processStep(phoneNumber, messageText, session);
-        userSessions.set(phoneNumber, session);
-
-    } catch (error) {
-        console.error('❌ Message handling error:', error);
-        // Don't let email errors crash the message handling
-        try {
-            await sendMessage(phoneNumber, "Sorry, something went wrong. Please type 'restart' to begin again.");
-        } catch (sendError) {
-            console.error('❌ Failed to send error message:', sendError);
-        }
-    }
 }
 
 // Process conversation steps
@@ -544,14 +510,19 @@ async function completeLeadCapture(phoneNumber, leadData) {
 
     await sendMessage(phoneNumber, summaryMessage);
     
-    // Save lead (with retry logic) - only if email is enabled
-    if (emailEnabled) {
-        await saveLeadWithRetry(leadData);
-    } else {
-        // Log to console as fallback
-        console.log('📧 Email not available, logging lead data:');
-        console.log(JSON.stringify(leadData, null, 2));
-    }
+    // Log lead data to console (since email is disabled)
+    console.log('🎉 NEW LEAD CAPTURED:');
+    console.log('📧 LEAD DATA (COPY THIS):');
+    console.log({
+        name: leadData.firstName,
+        phone: phoneNumber,
+        email: leadData.email,
+        address: leadData.address,
+        monthlyBill: leadData.electricalBill,
+        timestamp: leadData.timestamp,
+        salesEmail: CONFIG.SALES_EMAIL
+    });
+    console.log('----------------------------');
     
     // Send follow-up after 2 minutes
     setTimeout(async () => {
@@ -562,80 +533,23 @@ async function completeLeadCapture(phoneNumber, leadData) {
     setTimeout(async () => {
         await sendQuotationFollowUp(phoneNumber, leadData.firstName);
     }, 24 * 60 * 60 * 1000); // 24 hours
-    
-    // Enhanced logging
-    console.log('🎉 NEW LEAD CAPTURED:');
-    console.log({
-        name: leadData.firstName,
-        phone: phoneNumber,
-        email: leadData.email,
-        address: leadData.address,
-        monthlyBill: leadData.electricalBill,
-        timestamp: leadData.timestamp
-    });
-    console.log('----------------------------');
 }
 
-// Enhanced email saving with retry logic
-async function saveLeadWithRetry(leadData, retries = 3) {
-    if (!emailEnabled || !transporter) {
-        console.log('📧 Email not enabled, logging lead data instead:');
-        console.log('🎉 LEAD DATA (EMAIL BACKUP):');
-        console.log(JSON.stringify(leadData, null, 2));
-        console.log('----------------------------');
-        return;
+// Enhanced follow-up message
+async function sendFollowUpMessage(phoneNumber, firstName) {
+    try {
+        await sleep(CONFIG.RESPONSE_DELAY);
+        
+        const urgentMessage = `${firstName}, need an urgent quote? 🚀
+
+WhatsApp your details to ${CONFIG.SALES_PHONE} ASAP....he will advise and send you a quote.`;
+
+        await sendMessage(phoneNumber, urgentMessage);
+        console.log(`💬 Follow-up sent to ${phoneNumber}`);
+        
+    } catch (error) {
+        console.error('❌ Follow-up failed:', error.message);
     }
-
-    for (let i = 0; i < retries; i++) {
-        try {
-            await saveLeadToEmail(leadData);
-            console.log('📧 Lead saved to email successfully!');
-            return;
-        } catch (error) {
-            console.error(`❌ Email save attempt ${i + 1} failed:`, error.message);
-            if (i === retries - 1) {
-                // Final attempt failed - log to console as backup
-                console.error('🚨 CRITICAL: Email save failed completely. Lead data:');
-                console.error(JSON.stringify(leadData, null, 2));
-                console.log('----------------------------');
-            } else {
-                await sleep(2000); // Wait before retry
-            }
-        }
-    }
-}
-
-// Enhanced email content
-async function saveLeadToEmail(leadData) {
-    if (!transporter) {
-        throw new Error('Email transporter not available');
-    }
-
-    const emailContent = `
-🎉 NEW SOLAR LEAD CAPTURED!
-
-👤 Customer Details:
-• Name: ${leadData.firstName}
-• Phone: ${leadData.phoneNumber}
-• Email: ${leadData.email}
-• Address: ${leadData.address}
-• Monthly Bill: ${leadData.electricalBill}
-• Date: ${new Date(leadData.timestamp).toLocaleString('en-ZA')}
-
-💡 Priority: Follow up within 24 hours for best conversion!
-📞 Customer expects contact soon.
-
----
-${CONFIG.COMPANY_NAME} WhatsApp Bot
-Generated: ${new Date().toLocaleString('en-ZA')}
-    `;
-
-    await transporter.sendMail({
-        from: `"${CONFIG.COMPANY_NAME} Bot" <${CONFIG.EMAIL_USER}>`,
-        to: CONFIG.SALES_EMAIL,
-        subject: `🚨 NEW SOLAR LEAD: ${leadData.firstName} - ${leadData.electricalBill} monthly bill`,
-        text: emailContent
-    });
 }
 
 // Send 24-hour quotation follow-up
@@ -679,21 +593,6 @@ If you haven't, please contact ${CONFIG.SALES_PHONE} directly for immediate assi
         
     } catch (error) {
         console.error('❌ Quotation follow-up failed:', error.message);
-    }
-}
-async function sendFollowUpMessage(phoneNumber, firstName) {
-    try {
-        await sleep(CONFIG.RESPONSE_DELAY);
-        
-        const urgentMessage = `${firstName}, need an urgent quote? 🚀
-
-WhatsApp your details to ${CONFIG.SALES_PHONE} ASAP....he will advise and send you a quote.`;
-
-        await sendMessage(phoneNumber, urgentMessage);
-        console.log(`💬 Follow-up sent to ${phoneNumber}`);
-        
-    } catch (error) {
-        console.error('❌ Follow-up failed:', error.message);
     }
 }
 
@@ -801,10 +700,11 @@ app.get('/health', (req, res) => {
         uptime: process.uptime(),
         activeSessions: userSessions.size,
         environment: process.env.NODE_ENV || 'development',
-        version: '2.1.0',
+        version: '2.2.0',
         features: {
-            email: emailEnabled,
-            whatsapp: !!CONFIG.WHATSAPP_TOKEN
+            email: false, // Disabled for now
+            whatsapp: !!CONFIG.WHATSAPP_TOKEN,
+            leadLogging: true
         }
     };
     
@@ -833,7 +733,7 @@ app.get('/stats', (req, res) => {
         pendingFollowUpTimers: followUpTimers.size,
         totalMemoryUsage: process.memoryUsage(),
         uptime: process.uptime(),
-        emailEnabled
+        emailEnabled: false
     });
 });
 
@@ -845,8 +745,9 @@ app.get('/test', (req, res) => {
             hasWhatsAppToken: !!CONFIG.WHATSAPP_TOKEN,
             whatsappPhoneId: CONFIG.WHATSAPP_PHONE_ID,
             webhookToken: !!CONFIG.WEBHOOK_VERIFY_TOKEN,
-            emailEnabled,
-            environment: process.env.NODE_ENV
+            emailEnabled: false,
+            environment: process.env.NODE_ENV,
+            salesEmail: CONFIG.SALES_EMAIL
         }
     });
 });
@@ -860,11 +761,12 @@ process.on('SIGTERM', () => {
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`🤖 ${CONFIG.COMPANY_NAME} Chatbot v2.1 is running!`);
+    console.log(`🤖 ${CONFIG.COMPANY_NAME} Chatbot v2.2 is running!`);
     console.log(`📡 Server: http://localhost:${PORT}`);
     console.log(`🔗 Webhook: https://your-app-url.com/webhook`);
-    console.log(`📧 Email enabled: ${emailEnabled}`);
+    console.log(`📧 Email: DISABLED - Leads logged to console`);
     console.log(`📞 Sales WhatsApp: ${CONFIG.SALES_PHONE}`);
+    console.log(`💼 Business Email: ${CONFIG.BUSINESS_EMAIL}`);
     console.log('💡 Ready to capture solar leads!');
     
     // Test basic functionality
@@ -872,5 +774,6 @@ app.listen(PORT, () => {
     console.log(`✅ WhatsApp Token: ${CONFIG.WHATSAPP_TOKEN ? 'Set' : 'Missing'}`);
     console.log(`✅ Phone ID: ${CONFIG.WHATSAPP_PHONE_ID}`);
     console.log(`✅ Webhook Token: ${CONFIG.WEBHOOK_VERIFY_TOKEN ? 'Set' : 'Missing'}`);
-    console.log(`✅ Email: ${emailEnabled ? 'Configured' : 'Disabled'}`);
+    console.log(`✅ Email: Disabled (leads logged to console)`);
+    console.log(`✅ Sales Email: ${CONFIG.SALES_EMAIL}`);
 });
