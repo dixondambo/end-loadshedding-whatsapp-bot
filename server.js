@@ -104,6 +104,7 @@ if (emailEnabled && nodemailer) {
             if (error) {
                 console.error('❌ Email configuration error:', error.message);
                 emailEnabled = false;
+                transporter = null; // Disable transporter
             } else {
                 console.log('✅ Email server is ready');
             }
@@ -111,6 +112,7 @@ if (emailEnabled && nodemailer) {
     } catch (error) {
         console.error('❌ Failed to create email transporter:', error.message);
         emailEnabled = false;
+        transporter = null;
     }
 }
 
@@ -287,6 +289,7 @@ function getFollowUpMessage2(session) {
 function getFollowUpMessage3(session) {
     return "I'm still here to help you get started with solar. ☀️";
 }
+// Enhanced message handler with better flow control
 async function handleMessage(message) {
     try {
         const phoneNumber = message.from;
@@ -392,7 +395,12 @@ async function handleMessage(message) {
 
     } catch (error) {
         console.error('❌ Message handling error:', error);
-        await sendMessage(phoneNumber, "Sorry, something went wrong. Please type 'restart' to begin again.");
+        // Don't let email errors crash the message handling
+        try {
+            await sendMessage(phoneNumber, "Sorry, something went wrong. Please type 'restart' to begin again.");
+        } catch (sendError) {
+            console.error('❌ Failed to send error message:', sendError);
+        }
     }
 }
 
@@ -603,7 +611,10 @@ async function completeLeadCapture(phoneNumber, leadData) {
 // Enhanced email saving with retry logic
 async function saveLeadWithRetry(leadData, retries = 3) {
     if (!emailEnabled || !transporter) {
-        console.log('📧 Email not enabled, skipping email save');
+        console.log('📧 Email not enabled, logging lead data instead:');
+        console.log('🎉 LEAD DATA (EMAIL BACKUP):');
+        console.log(JSON.stringify(leadData, null, 2));
+        console.log('----------------------------');
         return;
     }
 
@@ -618,6 +629,7 @@ async function saveLeadWithRetry(leadData, retries = 3) {
                 // Final attempt failed - log to console as backup
                 console.error('🚨 CRITICAL: Email save failed completely. Lead data:');
                 console.error(JSON.stringify(leadData, null, 2));
+                console.log('----------------------------');
             } else {
                 await sleep(2000); // Wait before retry
             }
