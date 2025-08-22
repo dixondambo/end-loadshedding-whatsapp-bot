@@ -72,7 +72,7 @@ if (emailEnabled && nodemailer) {
         transporter = nodemailer.createTransport({
             service: 'gmail',
             auth: {
-                user: CONFIG.EMAIL_USER || CONFIG.BUSINESS_EMAIL,
+                user: CONFIG.EMAIL_USER,
                 pass: CONFIG.EMAIL_PASS
             },
             pool: true,
@@ -885,7 +885,7 @@ app.get('/health', (req, res) => {
             enabled: emailEnabled,
             configured: !!transporter,
             salesEmail: CONFIG.SALES_EMAIL,
-            senderEmail: CONFIG.EMAIL_USER || CONFIG.BUSINESS_EMAIL
+            senderEmail: CONFIG.EMAIL_USER
         }
     };
     
