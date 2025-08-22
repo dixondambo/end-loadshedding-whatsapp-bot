@@ -2,6 +2,19 @@ const express = require('express');
 const axios = require('axios');
 const app = express();
 
+// Try to load nodemailer safely
+let nodemailer;
+let emailEnabled = false;
+
+try {
+    nodemailer = require('nodemailer');
+    emailEnabled = true;
+    console.log('✅ Nodemailer loaded successfully');
+} catch (error) {
+    console.log('⚠️ Nodemailer not available, email features disabled');
+    console.log('Install with: npm install nodemailer');
+}
+
 app.use(express.json({ limit: '10mb' }));
 
 // User sessions storage with cleanup and follow-up tracking
@@ -50,6 +63,42 @@ for (const envVar of requiredEnvVars) {
     if (!process.env[envVar]) {
         console.warn(`⚠️  Warning: ${envVar} not set in environment variables`);
     }
+}
+
+// Email transporter setup with safe initialization
+let transporter;
+if (emailEnabled && nodemailer) {
+    try {
+        transporter = nodemailer.createTransport({
+            service: 'gmail',
+            auth: {
+                user: CONFIG.EMAIL_USER || CONFIG.BUSINESS_EMAIL,
+                pass: CONFIG.EMAIL_PASS
+            },
+            pool: true,
+            maxConnections: 5,
+            maxMessages: 100
+        });
+
+        // Verify email configuration on startup
+        transporter.verify((error, success) => {
+            if (error) {
+                console.error('❌ Email configuration error:', error.message);
+                console.log('💡 Leads will be logged to console as backup');
+                emailEnabled = false;
+                transporter = null;
+            } else {
+                console.log('✅ Email server is ready');
+                console.log(`📧 Leads will be sent to: ${CONFIG.SALES_EMAIL}`);
+            }
+        });
+    } catch (error) {
+        console.error('❌ Failed to create email transporter:', error.message);
+        emailEnabled = false;
+        transporter = null;
+    }
+} else {
+    console.log('📧 Email functionality disabled - leads will be logged to console');
 }
 
 // Webhook verification
@@ -150,46 +199,62 @@ async function handleMessage(message) {
 
         console.log(`👤 Current session step: ${session.step}`);
 
-        // Handle business information requests
-        if (messageText.includes('email') && (messageText.includes('your') || messageText.includes('business') || messageText.includes('contact'))) {
+        // Handle business information requests with case-insensitive matching
+        const lowerText = messageText.toLowerCase();
+        
+        if ((lowerText.includes('email') || lowerText.includes('e-mail')) && 
+            (lowerText.includes('your') || lowerText.includes('business') || lowerText.includes('contact') || lowerText.includes('what'))) {
             await sendMessage(phoneNumber, `Our business email is: ${CONFIG.BUSINESS_EMAIL}`);
             userSessions.set(phoneNumber, session);
             return;
         }
         
-        if (messageText.includes('address') && (messageText.includes('your') || messageText.includes('business') || messageText.includes('physical') || messageText.includes('office'))) {
+        if ((lowerText.includes('address') || lowerText.includes('location')) && 
+            (lowerText.includes('your') || lowerText.includes('business') || lowerText.includes('physical') || 
+             lowerText.includes('office') || lowerText.includes('where') || lowerText.includes('what'))) {
             await sendMessage(phoneNumber, `Our address is: ${CONFIG.BUSINESS_ADDRESS}`);
             userSessions.set(phoneNumber, session);
             return;
         }
         
-        if (messageText.includes('website') || messageText.includes('web site') || messageText.includes('site')) {
+        if (lowerText.includes('website') || lowerText.includes('web site') || lowerText.includes('site') || 
+            (lowerText.includes('web') && (lowerText.includes('your') || lowerText.includes('what')))) {
             await sendMessage(phoneNumber, `Our website is: ${CONFIG.BUSINESS_WEBSITE}`);
             userSessions.set(phoneNumber, session);
             return;
         }
         
-        // Handle installation area questions
-        if ((messageText.includes('install') || messageText.includes('service')) && 
-            (messageText.includes('area') || messageText.includes('city') || messageText.includes('town') || 
-             messageText.includes('region') || messageText.includes('province') || messageText.includes('where') ||
-             messageText.includes('durban') || messageText.includes('joburg') || messageText.includes('johannesburg') || 
-             messageText.includes('pretoria') || messageText.includes('cape town') || messageText.includes('bloemfontein') ||
-             messageText.includes('port elizabeth') || messageText.includes('nelspruit') || messageText.includes('polokwane'))) {
+        // Enhanced installation area questions
+        const areaKeywords = ['install', 'service', 'work', 'operate', 'available'];
+        const locationKeywords = ['area', 'city', 'town', 'region', 'province', 'where', 'place'];
+        const cityNames = ['durban', 'joburg', 'johannesburg', 'pretoria', 'cape town', 'bloemfontein', 
+                          'port elizabeth', 'nelspruit', 'polokwane', 'kimberley', 'pietermaritzburg',
+                          'east london', 'george', 'welkom', 'rustenburg', 'witbank', 'mpumalanga',
+                          'gauteng', 'kzn', 'western cape', 'eastern cape', 'free state', 'limpopo',
+                          'north west', 'northern cape'];
+        
+        const hasAreaKeyword = areaKeywords.some(keyword => lowerText.includes(keyword));
+        const hasLocationKeyword = locationKeywords.some(keyword => lowerText.includes(keyword));
+        const hasCityName = cityNames.some(city => lowerText.includes(city));
+        
+        if ((hasAreaKeyword && hasLocationKeyword) || (hasAreaKeyword && hasCityName) || 
+            (lowerText.includes('do you') && hasLocationKeyword)) {
             await sendMessage(phoneNumber, `Yes! We install anywhere in South Africa 🇿🇦 The installation and travel costs are included in your quote. Contact ${CONFIG.SALES_PHONE} for your personalized quote.`);
             userSessions.set(phoneNumber, session);
             return;
         }
         
-        // Handle quotation follow-up responses
+        // Handle quotation follow-up responses with better detection
         if (session.quotationFollowUp.scheduled && !session.quotationFollowUp.responseReceived) {
-            if (messageText.includes('yes') || messageText.includes('received') || messageText.includes('got')) {
+            if (lowerText.includes('yes') || lowerText.includes('received') || lowerText.includes('got') || 
+                lowerText.includes('have') || lowerText.includes('sent') || lowerText.includes('delivered')) {
                 session.quotationFollowUp.responseReceived = true;
                 session.quotationFollowUp.completed = true;
                 await sendMessage(phoneNumber, `Great! 🎉 Before making your decision, feel free to check out our customer reviews at https://www.hellopeter.com/endloadsheddingcom to see what others say about our solar installations.`);
                 userSessions.set(phoneNumber, session);
                 return;
-            } else if (messageText.includes('no') || messageText.includes('not') || messageText.includes('haven')) {
+            } else if (lowerText.includes('no') || lowerText.includes('not') || lowerText.includes('haven') || 
+                      lowerText.includes('didn') || lowerText.includes('nothing')) {
                 await sendMessage(phoneNumber, `No problem! Please contact ${CONFIG.SALES_PHONE} directly and they'll ensure you receive your quotation promptly. Sometimes quotes may go to spam folders, so please check there too.`);
                 userSessions.set(phoneNumber, session);
                 return;
@@ -197,14 +262,13 @@ async function handleMessage(message) {
         }
 
         // Handle restart/help commands
-        const lowerText = messageText.toLowerCase();
-        if (lowerText.includes('restart') || lowerText.includes('start over')) {
+        if (lowerText.includes('restart') || lowerText.includes('start over') || lowerText.includes('begin again')) {
             session.step = 'welcome';
             session.data = {};
             session.attempts = {};
             session.followUps = { count: 0, lastFollowUp: null, pendingMessages: new Map() };
             session.quotationFollowUp = { scheduled: false, completed: false, responseReceived: false };
-        } else if (lowerText.includes('help')) {
+        } else if (lowerText.includes('help') || lowerText.includes('assist') || lowerText.includes('support')) {
             await sendHelpMessage(phoneNumber);
             userSessions.set(phoneNumber, session);
             return;
@@ -508,19 +572,8 @@ async function completeLeadCapture(phoneNumber, leadData) {
 
     await sendMessage(phoneNumber, summaryMessage);
     
-    // Log lead data to console (since email is disabled)
-    console.log('🎉 NEW LEAD CAPTURED:');
-    console.log('📧 LEAD DATA (COPY THIS):');
-    console.log({
-        name: leadData.firstName,
-        phone: phoneNumber,
-        email: leadData.email,
-        address: leadData.address,
-        monthlyBill: leadData.electricalBill,
-        timestamp: leadData.timestamp,
-        salesEmail: CONFIG.SALES_EMAIL
-    });
-    console.log('----------------------------');
+    // Save lead with both email and console logging
+    await saveLeadWithRetry(leadData);
     
     // Send follow-up after 2 minutes
     setTimeout(async () => {
@@ -533,7 +586,129 @@ async function completeLeadCapture(phoneNumber, leadData) {
     }, 24 * 60 * 60 * 1000); // 24 hours
 }
 
-// Enhanced follow-up message
+// Enhanced email saving with retry logic and console backup
+async function saveLeadWithRetry(leadData, retries = 3) {
+    // Always log to console first as backup
+    console.log('🎉 NEW LEAD CAPTURED:');
+    console.log('📧 LEAD DATA:');
+    console.log({
+        name: leadData.firstName,
+        phone: leadData.phoneNumber,
+        email: leadData.email,
+        address: leadData.address,
+        monthlyBill: leadData.electricalBill,
+        timestamp: leadData.timestamp,
+        salesEmail: CONFIG.SALES_EMAIL
+    });
+    console.log('----------------------------');
+
+    // Try to send email if enabled
+    if (!emailEnabled || !transporter) {
+        console.log('📧 Email not enabled, lead saved to console only');
+        return;
+    }
+
+    for (let i = 0; i < retries; i++) {
+        try {
+            await saveLeadToEmail(leadData);
+            console.log('📧 Lead email sent successfully!');
+            return;
+        } catch (error) {
+            console.error(`❌ Email attempt ${i + 1} failed:`, error.message);
+            if (i === retries - 1) {
+                console.error('🚨 Email failed after all attempts - lead safely logged above');
+            } else {
+                await sleep(2000); // Wait before retry
+            }
+        }
+    }
+}
+
+// Enhanced email content with professional formatting
+async function saveLeadToEmail(leadData) {
+    if (!transporter) {
+        throw new Error('Email transporter not available');
+    }
+
+    const emailContent = `
+🎉 NEW SOLAR LEAD CAPTURED!
+
+👤 Customer Details:
+• Name: ${leadData.firstName}
+• Phone: ${leadData.phoneNumber}
+• Email: ${leadData.email}
+• Address: ${leadData.address}
+• Monthly Bill: ${leadData.electricalBill}
+• Date: ${new Date(leadData.timestamp).toLocaleString('en-ZA')}
+
+💡 Priority: Follow up within 24 hours for best conversion!
+📞 Customer expects contact soon.
+
+---
+${CONFIG.COMPANY_NAME} WhatsApp Bot
+Generated: ${new Date().toLocaleString('en-ZA')}
+    `;
+
+    const htmlContent = `
+<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #ddd; border-radius: 8px; padding: 20px;">
+    <div style="background: linear-gradient(135deg, #ff6b35, #f7931e); color: white; padding: 20px; border-radius: 8px 8px 0 0; margin: -20px -20px 20px -20px;">
+        <h2 style="margin: 0; font-size: 24px;">🎉 NEW SOLAR LEAD CAPTURED!</h2>
+        <p style="margin: 5px 0 0 0; opacity: 0.9;">High-priority customer inquiry</p>
+    </div>
+    
+    <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0;">
+        <h3 style="color: #333; margin-top: 0;">👤 Customer Details:</h3>
+        <table style="width: 100%; border-collapse: collapse;">
+            <tr><td style="padding: 8px 0; font-weight: bold; width: 30%;">Name:</td><td style="padding: 8px 0;">${leadData.firstName}</td></tr>
+            <tr><td style="padding: 8px 0; font-weight: bold;">Phone:</td><td style="padding: 8px 0;"><a href="tel:${leadData.phoneNumber}" style="color: #ff6b35; text-decoration: none;">${leadData.phoneNumber}</a></td></tr>
+            <tr><td style="padding: 8px 0; font-weight: bold;">Email:</td><td style="padding: 8px 0;"><a href="mailto:${leadData.email}" style="color: #ff6b35; text-decoration: none;">${leadData.email}</a></td></tr>
+            <tr><td style="padding: 8px 0; font-weight: bold;">Address:</td><td style="padding: 8px 0;">${leadData.address}</td></tr>
+            <tr><td style="padding: 8px 0; font-weight: bold;">Monthly Bill:</td><td style="padding: 8px 0; color: #d9534f; font-weight: bold; font-size: 18px;">${leadData.electricalBill}</td></tr>
+            <tr><td style="padding: 8px 0; font-weight: bold;">Date:</td><td style="padding: 8px 0;">${new Date(leadData.timestamp).toLocaleString('en-ZA')}</td></tr>
+        </table>
+    </div>
+    
+    <div style="background: #d4edda; padding: 15px; border-radius: 8px; border-left: 4px solid #28a745; margin: 20px 0;">
+        <p style="margin: 0; font-weight: bold; color: #155724;">⚡ URGENT ACTION REQUIRED:</p>
+        <p style="margin: 5px 0 0 0; color: #155724;">📞 Follow up within 24 hours for best conversion rate!</p>
+        <p style="margin: 5px 0 0 0; color: #155724;">🎯 Customer is expecting contact soon.</p>
+    </div>
+    
+    <div style="background: #fff3cd; padding: 15px; border-radius: 8px; border-left: 4px solid #ffc107; margin: 20px 0;">
+        <p style="margin: 0; font-weight: bold; color: #856404;">💰 Lead Value Estimate:</p>
+        <p style="margin: 5px 0 0 0; color: #856404;">Monthly bill of ${leadData.electricalBill} indicates potential system value of R${Math.floor(parseInt(leadData.electricalBill.replace(/[^0-9]/g, '')) * 12 * 0.8).toLocaleString()} - R${Math.floor(parseInt(leadData.electricalBill.replace(/[^0-9]/g, '')) * 12 * 1.2).toLocaleString()}</p>
+    </div>
+    
+    <div style="text-align: center; margin: 30px 0;">
+        <a href="tel:${leadData.phoneNumber}" style="background: #28a745; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">📞 Call Customer Now</a>
+        <a href="mailto:${leadData.email}" style="background: #007bff; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block; margin-left: 10px;">📧 Send Email</a>
+    </div>
+    
+    <hr style="margin: 30px 0; border: none; border-top: 1px solid #eee;">
+    <div style="text-align: center;">
+        <p style="color: #666; font-size: 12px; margin: 0;">
+            <strong>${CONFIG.COMPANY_NAME} WhatsApp Lead Bot</strong><br>
+            Generated: ${new Date().toLocaleString('en-ZA')}<br>
+            Lead Source: WhatsApp Business API
+        </p>
+    </div>
+</div>
+    `;
+
+    await transporter.sendMail({
+        from: `"${CONFIG.COMPANY_NAME} Lead Bot" <${CONFIG.EMAIL_USER || CONFIG.BUSINESS_EMAIL}>`,
+        to: CONFIG.SALES_EMAIL,
+        subject: `🚨 URGENT: New Solar Lead - ${leadData.firstName} (${leadData.electricalBill}/month)`,
+        text: emailContent,
+        html: htmlContent,
+        priority: 'high',
+        headers: {
+            'X-Priority': '1',
+            'X-MSMail-Priority': 'High',
+            'Importance': 'high'
+        }
+    });
+}
 async function sendFollowUpMessage(phoneNumber, firstName) {
     try {
         await sleep(CONFIG.RESPONSE_DELAY);
@@ -698,11 +873,19 @@ app.get('/health', (req, res) => {
         uptime: process.uptime(),
         activeSessions: userSessions.size,
         environment: process.env.NODE_ENV || 'development',
-        version: '2.2.0',
+        version: '2.3.0',
         features: {
-            email: false, // Disabled for now
+            email: emailEnabled,
             whatsapp: !!CONFIG.WHATSAPP_TOKEN,
-            leadLogging: true
+            leadLogging: true,
+            followUps: true,
+            quotationTracking: true
+        },
+        email: {
+            enabled: emailEnabled,
+            configured: !!transporter,
+            salesEmail: CONFIG.SALES_EMAIL,
+            senderEmail: CONFIG.EMAIL_USER || CONFIG.BUSINESS_EMAIL
         }
     };
     
