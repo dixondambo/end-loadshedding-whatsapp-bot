@@ -55,7 +55,7 @@ const CONFIG = {
     
     // Updated email configuration
     EMAIL_USER: process.env.EMAIL_USER || 'endloadshedding@gmail.com',
-    EMAIL_PASS: process.env.EMAIL_PASS || 'Solar@2025',
+    EMAIL_PASS: process.env.EMAIL_PASS || '@20endloadshedding',
     
     // Business settings
     SALES_PHONE: '+27843360063',
@@ -77,7 +77,7 @@ for (const envVar of requiredEnvVars) {
 let transporter;
 if (emailEnabled && nodemailer) {
     try {
-        transporter = nodemailer.createTransporter({
+        transporter = nodemailer.createTransport({
             service: 'gmail',
             auth: {
                 user: CONFIG.EMAIL_USER,
